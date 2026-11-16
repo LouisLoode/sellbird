@@ -25,8 +25,11 @@ from sellbird.state import StateManager
 
 logger = logging.getLogger("sellbird.trainer")
 
+MAX_OBJECTION_ATTEMPTS = 3
+
 from sellbird.paths import PROJECT_ROOT
 from sellbird.textio import read_user_text
+from sellbird.untrusted import UNTRUSTED_RULE, fence
 
 
 def _normalize_start_url(url: str) -> str:
@@ -372,6 +375,12 @@ def merge_trained_config(learned: dict, existing: dict | None) -> dict:
                 merged[section][key] = copy.deepcopy(learned[section][key])
     if untrained:
         merged["persona"].update(copy.deepcopy(learned.get("persona", {})))
+    # The offer is yours: retraining refreshes the ideas and never the offer.
+    learned_offer = (learned.get("product") or {}).get("offer") or {}
+    if learned_offer.get("entry_ideas") and isinstance(merged.get("product"), dict):
+        offer = merged["product"].setdefault("offer", {})
+        if isinstance(offer, dict):
+            offer["entry_ideas"] = list(learned_offer["entry_ideas"])
     if "brain" in learned:
         merged["brain"] = copy.deepcopy(learned["brain"])
     # The trained site joins your own domains (autopilot may link to it);
@@ -383,6 +392,15 @@ def merge_trained_config(learned: dict, existing: dict | None) -> dict:
             have = list(email.get("link_domains") or [])
             email["link_domains"] = have + [d for d in trained if d not in have]
     return merged
+
+
+def _offer_from(product_info: dict) -> dict:
+    """The offer ideas training found. Training never picks the offer: the
+    user works it out with their agent (CLAUDE.md, Step 3b) and confirms it
+    on Your company."""
+    ideas = product_info.get("entry_offer_ideas")
+    ideas = [str(i).strip() for i in ideas if str(i).strip()][:4] if isinstance(ideas, list) else []
+    return {"entry_ideas": ideas}
 
 
 def _backup(path: Path, raw: str) -> Path:
@@ -521,7 +539,16 @@ class Trainer:
 
         # Step 5: Generate objection responses
         print("[5/6] Generating objection handling playbook...")
-        objections = await self._generate_objections(product_info, competitive_intel)
+        objections = await self._generate_objections(
+            product_info,
+            competitive_intel,
+        )
+
+        if not objections:
+            print("\nERROR: Could not generate a valid objection playbook.")
+            print("Training stopped. Existing configuration was not modified.")
+            return None
+
         print(f"      Prepared {len(objections)} objection responses.\n")
 
         # Step 6: Generate config + skills
@@ -551,6 +578,14 @@ class Trainer:
         print(f"  ICP titles:   {', '.join(config['icp']['titles'])}")
         print(f"  Industries:   {', '.join(config['icp']['industries'])}")
         print(f"  Pages crawled: {len(self.scraped_pages)}")
+        offer = (config.get("product") or {}).get("offer") or {}
+        if offer.get("entry"):
+            print(f"\n  First-email offer: {offer['entry']}")
+        else:
+            print("\n  Next: work out the offer every first email ends with. Ask your coding agent")
+            print("  to work it out with you, or open the dashboard's Your company tab.")
+            if offer.get("entry_ideas"):
+                print("  Ideas to start from: " + "; ".join(offer["entry_ideas"]))
         print(f"\n  Files generated:")
         print(f"    - {config_path}")
         print(f"    - skills/product_knowledge.md")
@@ -567,7 +602,11 @@ class Trainer:
         return config
 
     def _get_all_content(self, max_chars: int = 60000) -> str:
-        """Combine all scraped pages into one string for analysis."""
+        """All scraped pages as one <untrusted> block, for analysis.
+
+        Even your own site can carry text you didn't write (comments,
+        reviews, a page someone else controls), and what training learns
+        goes into every email afterwards, so the pages are fenced as data."""
         all_content = ""
         for url, content in self.scraped_pages.items():
             path = urlparse(url).path or "/"
@@ -576,7 +615,7 @@ class Trainer:
             all_content += f"\n\n--- PAGE: {path} ---\n{page_content}"
             if len(all_content) > max_chars:
                 break
-        return all_content
+        return fence(all_content, "your website")
 
     async def _extract_product_info(self) -> dict:
         """Ask Claude to extract product information from all crawled content."""
@@ -586,6 +625,8 @@ class Trainer:
 
 WEBSITE CONTENT ({len(self.scraped_pages)} pages):
 {all_content}
+
+{UNTRUSTED_RULE}
 
 Extract the following and return as JSON:
 {{
@@ -602,7 +643,8 @@ Extract the following and return as JSON:
   "social_proof": ["any case studies, testimonials, notable customers, or stats mentioned"],
   "integrations": ["tools and platforms this integrates with"],
   "use_cases": ["specific use case 1", "use case 2", "use case 3"],
-  "tone": "describe the brand's communication tone in 3-4 words"
+  "tone": "describe the brand's communication tone in 3-4 words",
+  "entry_offer_ideas": ["3 or 4 things this business could offer a prospect for free in a first cold email: specific, useful on their own, quick for this business to deliver, and tied to what it sells. E.g. for a web designer 'a mockup of your homepage with online booking', for an SEO agency 'a one-page report on where you rank and why', for inventory software 'a reorder forecast for your top 20 SKUs'. Never a discount or a generic call."]
 }}
 
 Be thorough — you have access to the full website. Extract everything relevant."""
@@ -620,6 +662,8 @@ to understand exactly who this product is built for.
 
 WEBSITE CONTENT ({len(self.scraped_pages)} pages):
 {all_content}
+
+{UNTRUSTED_RULE}
 
 Return as JSON:
 {{
@@ -677,6 +721,8 @@ Known competitors: {', '.join(product_info.get('competitors', []))}
 WEBSITE CONTENT:
 {all_content}
 
+{UNTRUSTED_RULE}
+
 Look for comparison pages, "why us" messaging, feature differentiation,
 and any mentions of competitors or alternatives.
 
@@ -700,20 +746,34 @@ If the website doesn't mention specific competitors, infer the most likely ones 
         result = await self.brain.think_json(prompt, session_id="sellbird-trainer")
         return result if isinstance(result, dict) else {"competitors": []}
 
-    async def _generate_objections(self, product_info: dict, competitive_intel: dict) -> dict:
-        """Generate objection handling responses based on product + competitive intel."""
+
+    async def _generate_objections(
+        self, product_info: dict, competitive_intel: dict
+    ) -> dict | None:
+        """Generate and validate objection responses with bounded retries."""
         competitors = competitive_intel.get("competitors", [])
-        competitor_names = [c.get("name", "") for c in competitors if isinstance(c, dict)]
+        competitor_names = [
+            c.get("name", "")
+            for c in competitors
+            if isinstance(c, dict) and isinstance(c.get("name", ""), str)
+        ]
+
+        key_benefits = product_info.get("key_benefits", [])
+        differentiators = product_info.get("differentiators", [])
+        if not isinstance(key_benefits, list):
+            key_benefits = []
+        if not isinstance(differentiators, list):
+            differentiators = []
 
         prompt = f"""You are a world-class B2B sales trainer. Based on this product and its competitive
-landscape, generate the most common objections a prospect would raise, with killer responses.
+landscape, generate the most common objections a prospect would raise, with consultative responses.
 
 Product: {product_info.get('product_name', '')}
 Description: {product_info.get('product_description', '')}
 Pricing: {product_info.get('pricing', '')}
-Key Benefits: {', '.join(product_info.get('key_benefits', []))}
+Key Benefits: {', '.join(str(item) for item in key_benefits)}
 Competitors: {', '.join(competitor_names)}
-Differentiators: {', '.join(product_info.get('differentiators', []))}
+Differentiators: {', '.join(str(item) for item in differentiators)}
 
 Generate 8-12 objections covering:
 - Price/budget concerns
@@ -726,10 +786,59 @@ Generate 8-12 objections covering:
 Each response should be 1-2 sentences, consultative (not defensive), and end with
 a question or redirect that keeps the conversation going.
 
-Return as a JSON object where keys are the objection and values are the response."""
+Return a JSON object where keys are objections and values are non-empty responses."""
 
-        result = await self.brain.think_json(prompt, session_id="sellbird-trainer")
-        return result if isinstance(result, dict) else {}
+        for attempt in range(MAX_OBJECTION_ATTEMPTS):
+            result = await self.brain.think_json(
+                prompt,
+                session_id="sellbird-trainer",
+            )
+
+            # A provider outage is different from malformed model output.
+            if getattr(self.brain, "last_reply_empty", False):
+                logger.warning(
+                    "Objection generation stopped: provider returned no response."
+                )
+                return None
+
+            # Accept only a non-empty dictionary of non-empty string pairs.
+            if isinstance(result, dict) and result:
+                valid = all(
+                    isinstance(objection, str)
+                    and objection.strip()
+                    and isinstance(response, str)
+                    and response.strip()
+                    for objection, response in result.items()
+                )
+                if valid:
+                    cleaned = {
+                        objection.strip(): response.strip()
+                        for objection, response in result.items()
+                    }
+                    logger.info(
+                        "Generated %s valid objection responses.", len(cleaned)
+                    )
+                    return cleaned
+
+            if attempt < MAX_OBJECTION_ATTEMPTS - 1:
+                logger.warning(
+                    "Invalid objection playbook. Retrying attempt %s/%s.",
+                    attempt + 1,
+                    MAX_OBJECTION_ATTEMPTS,
+                )
+                prompt += """
+
+IMPORTANT: Your previous response was invalid or empty.
+Return a NON-EMPTY JSON object containing objection strings as keys
+and non-empty consultative response strings as values.
+Do not return an empty object, markdown, or explanations.
+"""
+
+        logger.error(
+            "Objection generation failed after %s attempts.",
+            MAX_OBJECTION_ATTEMPTS,
+        )
+        return None
 
     async def _generate_product_knowledge(
         self, product_info: dict, icp_info: dict, competitive_intel: dict
@@ -871,6 +980,7 @@ What prospects do instead of buying a solution like ours:
                 "pricing": product_info.get("pricing", "Contact for pricing"),
                 "key_benefits": product_info.get("key_benefits", []),
                 "objection_responses": objections,
+                "offer": _offer_from(product_info),
             },
             "icp": {
                 "industries": icp_info.get("industries", ["Technology"]),

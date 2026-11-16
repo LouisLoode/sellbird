@@ -40,9 +40,10 @@ from sellbird.brain import Brain
 from sellbird.collectors import people as people_mod
 from sellbird.collectors.discover import is_junk, site_name_from_html
 from sellbird.collectors.profile import (
-    _meta_description, _page_title, _reads_like_title, looks_like_challenge,
+    _meta_description, _page_title, _reads_like_title, fold_accents, looks_like_challenge,
 )
-from sellbird.config import SellbirdConfig, EnvConfig
+from sellbird.config import SellbirdConfig, EnvConfig, live_do_not_contact
+from sellbird.gate import do_not_contact_domain_match
 from sellbird.icp_filter import has_exclusions, site_excluded
 from sellbird.integrations.email_finder import (
     DEFAULT_PATTERN, SMALL_BUSINESS_PATTERN, find_email, site_email_evidence,
@@ -128,6 +129,10 @@ _SENIOR_KEYWORDS = (
     "ceo", "cto", "cfo", "cmo", "coo", "cro", "chief", "founder",
     "co-founder", "president", "owner", "partner", "vp", "vice president",
     "svp", "evp", "head of", "director",
+    # French (Québec), matched with accents folded
+    "pdg", "president", "presidente", "proprietaire", "coproprietaire", "fondateur",
+    "fondatrice", "cofondateur", "cofondatrice", "associe", "associee", "vice-president",
+    "vice-presidente", "directeur", "directrice",
 )
 
 
@@ -206,6 +211,38 @@ class Scout:
             details={"prospects_found": prospects_found},
         )
         logger.info(f"Scout: Found {prospects_found} new prospects this cycle.")
+
+    # ── Do-not-contact ──
+
+    def _do_not_contact_entry(self, domain: str) -> str:
+        """The compliance.do_not_contact entry covering ``domain``, or "".
+
+        The send gate is the last word, but it is the wrong place to learn
+        a company is off limits: by then Scout has read its site, found a
+        person and spent a verification credit on their address. Every
+        strategy asks this before touching a company, with the same matcher
+        the gate uses, and the list as the config file says it is now.
+        """
+        try:
+            entries = live_do_not_contact(self.config)
+        except Exception as e:
+            logger.debug(f"do_not_contact list unavailable: {e}")
+            return ""
+        return do_not_contact_domain_match(domain, entries)
+
+    async def _skip_listed_company(self, company: dict, domain: str) -> bool:
+        """True when a known company is on the do-not-contact list. It is
+        marked checked so the backfill rotation moves on instead of
+        offering it again every cycle."""
+        entry = self._do_not_contact_entry(domain)
+        if not entry:
+            return False
+        logger.info(f"Scout: {domain} is on compliance.do_not_contact ({entry}); skipping.")
+        try:
+            await self.state.mark_prospects_checked(company["id"])
+        except Exception as e:
+            logger.debug(f"mark_prospects_checked failed for {domain}: {e}")
+        return True
 
     # ── Prospect dedup helpers ──
 
@@ -600,6 +637,8 @@ class Scout:
             if not domain:
                 continue
 
+            if await self._skip_listed_company(company, domain):
+                continue
             if await hunter_searches_remaining(self.state) <= 0:
                 break
             await record_hunter_search(self.state)
@@ -686,6 +725,9 @@ class Scout:
         for company in companies:
             domain = (company.get("domain") or "").strip()
             if not domain:
+                continue
+
+            if await self._skip_listed_company(company, domain):
                 continue
 
             contacts = await self._contacts_from_company(
@@ -902,6 +944,10 @@ class Scout:
             if not domain or domain in seen:
                 continue
             seen.add(domain)
+            if entry := self._do_not_contact_entry(domain):
+                logger.info(
+                    f"Scout: {domain} is on compliance.do_not_contact ({entry}); skipping.")
+                continue
             unique.append(c)
         companies = unique[:MAX_COMPANIES_PER_CYCLE]
 
@@ -1943,6 +1989,10 @@ Respond ONLY with the JSON array."""
                 domain = ""
             if not self._is_candidate_domain(domain):
                 continue
+            if entry := self._do_not_contact_entry(domain):
+                logger.info(
+                    f"Scout: {domain} is on compliance.do_not_contact ({entry}); skipping.")
+                continue
             if await self.state.company_exists(domain):
                 self._seen_domains.add(domain)
                 continue
@@ -2194,7 +2244,7 @@ Respond ONLY with the JSON array."""
         if self.config.icp.titles:
             return people_mod.title_matches(title, self.config.icp.titles)
         # No explicit ICP titles → fall back to any senior title.
-        title_lower = title.lower()
+        title_lower = fold_accents(title).lower()
         return any(re.search(rf"(?<![\w-]){re.escape(kw)}\b", title_lower)
                    for kw in _SENIOR_KEYWORDS)
 
@@ -2207,16 +2257,24 @@ Respond ONLY with the JSON array."""
         """Infer seniority level from a job title."""
         if not title:
             return ""
-        t = title.lower()
+        t = fold_accents(title).lower()
+        # "Directeur général adjoint", "Adjointe à la présidence": below the top.
+        deputy = re.search(r"\b(?:adjointe?|assistante?|sous-\w+)\b", t)
+        vice = re.search(r"\bvice[- ]president", t)
         if any(kw in t for kw in ["ceo", "cto", "cfo", "cmo", "coo", "cro",
                                   "chief", "founder", "co-founder", "owner",
-                                  "president"]) and "vice president" not in t:
+                                  "president", "pdg", "p.-d.g", "proprietaire",
+                                  "fondat"]) and not vice and not deputy:
             return "c_suite"
-        if any(kw in t for kw in ["vp", "vice president", "svp", "evp", "head of"]):
+        # The directeur général runs a Québec small business.
+        if re.search(r"\bdirect(?:eur|rice) generale?\b", t) and not deputy:
+            return "c_suite"
+        if vice or any(kw in t for kw in ["vp", "svp", "evp", "head of"]):
             return "vp"
-        if "director" in t:
+        if any(kw in t for kw in ["director", "directeur", "directrice"]):
             return "director"
-        if any(kw in t for kw in ["manager", "team lead", "lead "]):
+        if any(kw in t for kw in ["manager", "team lead", "lead ", "gerant", "gestionnaire",
+                                  "superviseur", "contremaitre", "chef d'equipe"]):
             return "manager"
         return "individual"
 

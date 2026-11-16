@@ -125,6 +125,162 @@ minor versions can still change behaviour.
 - **Company fit and the company register.** The Companies tab now shows a
   0-100 fit score (click Fit to sort by it), worked out from what Sellbird already holds: the ICP sector
 
+- **`writer.require_tip: true` skips prospects with nothing to build a tip
+  on.** A first email is meant to name one concrete thing the sender would
+  change; with no finding about the company, the draft could only say it had no
+  advice. With the option on, the Writer writes only for a prospect with a site
+  finding, a startup fact, a signal or the Scout's notes, and marks the others
+  `no_tip` (not left `new`, which makes the heartbeat retry them every cycle).
+  The dashboard shows them as "Nothing to write about yet", `sellbird status`
+  counts them, and `sellbird retry-writes --no-tip` puts them back in line. Off by default. The company's location
+  is also in the Writer's facts now.
+- **An Italian `compliance.opt_out_line` passes validation.** "Non ti
+  interessa? Rispondi pure e non ti scriverò più." is accepted, like the
+  English, Spanish and Hebrew lines already were, so an Italian sender no
+  longer needs a bilingual footer. A sign-off like "A presto!" is still
+  refused. Italian replies are still read by the model, not by rule.
+- **`channels.email.follow_ups: false` sends no follow-ups.** A campaign then
+  stages only its first email on Gmail, Microsoft and SMTP, so steps 2 and 3
+  can't go to someone who never answered. Replies are read and answered as
+  before. On by default, so nothing changes unless you turn it off.
+
+### Changed
+
+- **The writer sees what Sellbird read off a company's own site.** The free
+  homepage signals (no structured data, a site untouched for six months, a very
+  small sitemap, AI crawlers blocked) were collected but
+  never reached the writer's prompt, so an email asked to name one concrete
+  thing to change had nothing true to name and said it hadn't looked. Findings
+  that are true now go in as fact lines, each saying how it was found and that
+  the check can miss things; a signal checked and found fine is left out. "No
+  online booking" is not passed on: a homepage read misses widgets that load
+  late, and it called a bookable business unbookable too often.
+  Those findings come from one page and can be wrong, so `writer.site_facts:
+  false` turns them off, and `CLAUDE.md` and the approval guide now tell
+  Claude to offer a browser check of each draft's claims before the user
+  approves.
+- **The cold-email check takes a sender based in any of Precleared's
+  fourteen countries.** `compliance.precleared.sender_country` accepts GB, US,
+  CA, DE, FR, AU, IE, NL, ES, IT, LV, AE, EG and QA (`UK`, `USA` and `UAE` are
+  read as their codes), where it took only GB or US; `sellbird setup` asks for
+  a two-letter code and lists them when the answer isn't one. A sender whose
+  timezone is Europe/London is told the check is recommended for them and
+  offered GB as their country; it still waits for their yes. The docs say a
+  new key's 14 days at 100 checks a day start at its first check.
+- Seeding the signal catalog writes only a signal that is missing or whose catalog text changed. The dashboard seeds on every Today load, so this was a write per signal on every page view.
+- **The opt-out line takes any wording.** `compliance.opt_out_line` no longer
+  has to ask for a keyword: "Not interested? Just let me know and I won't email
+  you again." is the new default. Clear phrases are still caught by rule, and
+  the model reads every other reply for a request to stop. The line must still
+  say the emails can stop, however it's worded, so a sign-off like "Cheers!" is
+  refused; `""` leaves the line off on purpose. A link or an email address is
+  still refused.
+- **An `unknown` answer from the cold-email check holds the email instead of
+  failing it.** Precleared answers `unknown` when a fact can't be established,
+  usually the recipient's country, sometimes a register that was too slow.
+  That email now waits in the Outbox with what would settle it (set
+  `prospect_country`, or give the company a location or number) and is asked
+  about again, after six hours and then after a day; the third unknown on the
+  same facts fails it as before. Rejecting or sending the email clears the
+  note, as for an address the check couldn't reach.
+
+### Security
+
+- **Autopilot holds phone numbers and money requests.** An email nobody
+  approved now waits in the Outbox when it gives a phone number that isn't
+  yours (`channels.email.phone_numbers`, or one in your postal address) or
+  asks the reader to send money (wire or bank transfer, IBAN, crypto, gift
+  cards and the like), as it already did for links to domains that aren't
+  yours. A planted "call this number instead" can't go out on its own.
+- **Training reads your website as data.** The pages `sellbird train` crawls
+  are fenced as untrusted text, like replies and research already were, so
+  a comment or review on your site can't steer what training writes into
+  every later email.
+
+### Added
+
+- **Owners on French-language sites.** Finding the decision maker now reads
+  Québec French: propriétaire, président(e), PDG, président-directeur
+  général, fondateur/fondatrice, directeur/directrice général(e) and
+  associé(e), with or without accents. A feminine title satisfies its
+  masculine ICP entry ("Présidente" for "Président"), and an ICP written
+  only in French still targets the owner. Sentences such as "fondée par…",
+  "notre président et fondateur, …" and "… est propriétaire de l'entreprise"
+  are read, names with accents and hyphens (Marie-Ève, Côté) count as
+  names, and the site's "Équipe", "À propos" and "Nous joindre" pages are
+  followed. Before, these sites fell back to the published info@ address.
+- **French opt-outs.** `compliance.opt_out_line` accepts French wording ("Pas intéressé? Répondez-moi simplement et je ne vous écrirai plus."), with or without accents; before, a French line failed validation and the whole config wouldn't load. Replies saying "non merci", "ARRÊT", "désabonnez-moi", "ne m'écrivez plus" or "pas intéressé" are caught by rule like the English, Hebrew and Spanish ones, and "Envoyé de mon iPhone" no longer hides a bare opt-out.
+- **A menu-bar app.** `sellbird tray` (macOS menu bar, Windows tray)
+  starts the dashboard when needed, starts and stops Sellbird, pauses and
+  resumes sending and opens the dashboard unlocked. `sellbird autostart
+  install` starts it at login. See "The menu-bar app" in
+  [docs/configuration.md](docs/configuration.md).
+- **Several sending inboxes.** Besides the main mailbox, connect Gmail,
+  Microsoft 365 or SMTP inboxes you already own with
+  `sellbird inboxes connect`. Their sign-ins and passwords live in the
+  system keychain. Each new thread goes to the inbox with the most room;
+  follow-ups and replies leave from the thread's own inbox. Each inbox has
+  its own daily cold cap (`channels.email.per_inbox_daily_cap`, or your own
+  number) and warmup ramp, and can be paused, renamed, removed or limited
+  to some campaigns. Replies are read from every inbox. With one inbox
+  nothing changes. The dashboard's Inboxes tab shows them, opens each one
+  to pause, cap, rename or remove it, and adds one (a Gmail or Microsoft
+  sign-in in your browser, or an SMTP password that goes straight to your
+  keychain). Your coding agent can list them and pause one, never add or
+  remove one. See "Several sending inboxes" in
+  [docs/configuration.md](docs/configuration.md).
+- **An MCP server for your coding agent.** `sellbird mcp install` adds
+  Sellbird to Claude Code (or Codex), showing the change first. The agent
+  reads everything Sellbird knows, estimates discovery costs and can pause
+  sending, through the running dashboard with its own token
+  (`data/agent-token`). Every approval, setting, key, purchase and resume
+  stays yours: the agent's token reaches only a short allowlist of routes.
+  An extension can add tools and open its own routes to the agent. See
+  "Your coding agent (MCP)" in [docs/configuration.md](docs/configuration.md).
+- **Suppressions.** Addresses and whole domains Sellbird never emails,
+  kept in the database: an opt-out or a bounce adds the address, and
+  `sellbird suppressions` lists, adds and removes them. A suppressed domain
+  covers its subdomains. Nothing suppressed is staged, sent, or uploaded to
+  Instantly. Undoing someone's opt-out lifts its suppression too.
+  `compliance.do_not_contact` stays the hand-kept list in `sellbird.yaml`.
+- **Send rules and headers for extensions.** An extension can hold or cancel
+  an email after Sellbird's own checks, and add headers such as
+  `List-Unsubscribe`. An email that needs headers its inbox can't carry
+  waits rather than going out without them. See [docs/extensions.md](docs/extensions.md).
+- **Mail providers take who they send as, and where their sign-in lives.**
+  Gmail, Microsoft 365 and SMTP accept an identity (address and name; the
+  persona by default), Gmail and Microsoft a token source (the token file by
+  default) and an httpx transport, and SMTP its own server settings, so a
+  caller can connect more than one inbox. Signing in as a different account
+  than the inbox being connected saves nothing.
+- **Extensions.** A separate package can add dashboard routes, steps that
+  run each heartbeat cycle and `sellbird` subcommands through the
+  `sellbird.extensions` entry point, without patching Sellbird. A failing
+  extension stops Sellbird with its name; a failing step is logged and
+  skipped. `sellbird.dashboard.build_app(guard=, routers=)` serves the
+  dashboard for someone else, with its own sign-in and a per-request home.
+  See [docs/extensions.md](docs/extensions.md).
+- **Storage and settings seams.** Every database open goes through
+  `sellbird.storage`: SQLite paths as before, or `<prefix>:<name>` for a
+  backend an extension registers (in code or through the `sellbird.storage`
+  entry point), which owns and checks its own schema. `sellbird.config.use_config`
+  sets the config `load_config()` returns for a task and its threads, for
+  settings kept somewhere other than `sellbird.yaml`. A self-hosted install
+  behaves exactly as before.
+- **Runs from a home folder, not only from a checkout.** Installed with `pip`
+  or `pipx`, Sellbird used to look for its config, prompts and skills inside
+  site-packages. Now one home folder holds them: `SELLBIRD_HOME` if set, else
+  the checkout (unchanged), else the per-user data folder. The package ships
+  the defaults and copies in what's missing on first run, never overwriting
+  your edits. The Docker image sets `SELLBIRD_HOME=/app`. See "Where your
+  files live" in the README.
+- **Verifier API keys stay out of logs** (from #185 by @techity-mushtaque).
+  Hunter's key now goes in the `X-API-KEY` header; Reoon and ZeroBounce only
+  take it in the URL, so the `httpx` and `httpcore` loggers stay at WARNING and
+  Sellbird's own debug lines blank the key out of error text.
+- **`channels.email.min_write_score`** (default 0): the writer skips prospects
+  scored below it. Scout also checks `compliance.do_not_contact` before
+  reading a listed company's site or spending verification credits on it.
 - **A free Precleared key in one step** (from #121 by @gabrielaoimevbore-beep).
   `sellbird setup` now offers to get a free key for the cold-email check with
   just an email address, instead of sending people to a web page and back, and
@@ -134,6 +290,23 @@ minor versions can still change behaviour.
   a day) runs out, the Today page, `sellbird status` and the Outbox reason point
   to the command. Free keys now give 100 checks a day for their first 14 days,
   then 25, and the docs say so.
+
+### Changed
+
+- **`Referrer-Policy: same-origin`** on the dashboard, instead of
+  `no-referrer`: under `no-referrer` Firefox sends `Origin: null` on POSTs,
+  which the dashboard's provenance check refuses. Other sites still never
+  get a Referer.
+- **Microsoft 365: a send that may have gone out keeps its draft.** A 5xx or
+  a dropped connection on the final send no longer deletes the draft, and
+  the Outbox marks the email as possibly sent (never retried). A 4xx refusal
+  still deletes it. Any provider that reports a possible send is marked the
+  same way.
+
+### Fixed
+
+- **Instantly's daily cap counts your local day, not UTC** (from #177 by
+  @solvejet-team), so the cap resets at your midnight.
 
 ## [0.4.0] - 2026-11-06
 
