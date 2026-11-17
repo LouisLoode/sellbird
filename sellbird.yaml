@@ -70,7 +70,11 @@ channels:
     #                           # everyone else | en | fr
     # contacts_per_company: 1   # cold email to this many people per company at
     #                           # a time, most senior first (0 = no limit)
+    # phone_numbers: ["+1 555 010 2000"]  # your own numbers; on autopilot, an
+    #                                  # email giving any other number waits for you
     send_to_risky: false        # also send to catch-all domains (off = safest)
+    # min_write_score: 60       # only write for prospects Scout scored at
+    #                           # least this (0-100); 0 or unset = everyone
     max_bounce_rate: 0.05       # pause all sending if bounces exceed this
     # New sending domain? Set start_date to the day your warmup service went
     # on: no cold email for min_days, then the cold cap climbs from
@@ -117,17 +121,18 @@ channels:
 usage:
   max_daily_claude_percent: 80
   heartbeat_interval_minutes: 15
-  # quiet_hours:
-  #   start: "22:00"
-  #   end: "07:00"
-  #   timezone: "America/New_York"
+  quiet_hours:
+    start: "22:00"
+    end: "07:00"
+    timezone: "America/New_York"
     # days: [mon, tue, wed, thu, fri]   # the days quiet hours apply (default:
     #                                  # every day). Quiet 08:00-20:00 on weekdays
     #                                  # keeps Sellbird's work to nights and weekends.
 
 # Optional: check each new recipient with Precleared (precleared.dev) before
-# the first cold email: may cold marketing email go to this address under UK
-# PECR, US CAN-SPAM, Canada's CASL, Germany's UWG and France's rules? Any other
+# the first cold email: may cold marketing email go to this address under the
+# rules of the recipient's country (UK PECR, US CAN-SPAM, Canada's CASL,
+# Germany's UWG, France's CPCE and the rest of Precleared's fourteen)? Any other
 # answer holds the email back, with the reason in the Outbox. One check per
 # address; 10 a day free without a key. A free key (PRECLEARED_API_KEY in .env,
 # which `sellbird precleared-key` gets for you) allows 100 a day for its first 14
@@ -140,9 +145,9 @@ compliance:
   # postal address you receive mail at: a street address, PO box or virtual
   # mailbox. Until it's set, cold email still sends, with a warning.
   postal_address: ""
-  # Keep wording Sellbird recognises as an opt-out ("no thanks", "unsubscribe").
-  opt_out_line: 'Not interested? Reply "no thanks" and I won''t email again.'
-  # Under an email written in French; must ask for "non merci" or "STOP".
+  # Any wording works: Sellbird reads every reply for a request to stop.
+  opt_out_line: "Not interested? Just let me know and I won't email you again."
+  # Under an email written in French; any wording that says the emails can stop.
   # opt_out_line_fr: "Pas intéressé ? Répondez « non merci » et je ne vous écrirai plus."
   # Never email these, cold or in reply: competitors, your existing customers,
   # anyone under a legal hold. An entry is an address or a domain, and a domain
@@ -156,7 +161,8 @@ compliance:
   #   - "jane@acme.example"
   precleared:
     enabled: false
-    sender_country: ""          # GB or US: where your business is based
+    sender_country: ""          # where your business is based: GB, US, CA, DE, FR, AU,
+                                # IE, NL, ES, IT, LV, AE, EG or QA
     address_source: "unknown"   # published | bought | scraped | given | unknown
     prospect_country: ""        # optional, e.g. US if all your prospects are in one country
     # Sellbird also tells Precleared the recipient's country when the company's
@@ -178,3 +184,14 @@ compliance:
 #                               # The send gate still holds every email to 220
 #                               # words and one link. The file is gitignored.
 # Your own emails in skills/voice_samples.md make the writer match your voice.
+
+# When someone says yes to your offer, hand them to the system that delivers it:
+# one tool on its MCP server. See sellbird/handoff.py. Leave it out to handle it yourself.
+# handoff:
+#   mcp_url: https://example.com/mcp
+#   token_env: EXAMPLE_MCP_TOKEN          # the .env variable holding its bearer token
+#   tool: create_site
+#   arguments:
+#     company: "{company}"
+#     website: "{website}"
+#     email: "{email}"

@@ -378,13 +378,17 @@ async def test_a_short_address_mentioned_in_the_body_still_gets_the_footer(state
     assert provider.sent[0]["body"].endswith("\n\nAustin, TX\n" + LINE)
 
 
-def test_opt_out_line_must_be_recognisable_and_link_free():
+def test_opt_out_line_takes_any_wording_but_no_link():
     import pydantic
     for bad in ("To unsubscribe, visit https://acme.com/u", "Click here to leave",
-                "Thanks for reading!"):
+                "Email me at jo@acme.com to stop"):
         with pytest.raises(pydantic.ValidationError):
             ComplianceConfig(opt_out_line=bad)
-    assert ComplianceConfig(opt_out_line="Reply STOP to opt out.").opt_out_line
+    # Any wording: the model reads every reply for a request to stop.
+    for good in ("Reply STOP to opt out.", "Just let me know and I won't email you again.",
+                 "Not the right time? Say so and I'll leave you be."):
+        assert ComplianceConfig(opt_out_line=good).opt_out_line == good
+    assert "Just let me know" in ComplianceConfig().opt_out_line
     assert ComplianceConfig(opt_out_line="").opt_out_line == ""
     # Left blank in YAML (null) means empty, not a crash.
     assert ComplianceConfig(postal_address=None, opt_out_line=None).opt_out_line == ""
@@ -507,14 +511,22 @@ async def test_opt_outs_with_signatures_or_wrapped_lines_are_caught(state, body)
     assert status == "opted_out" and prompts == []
 
 
-def test_opt_out_line_must_ask_for_a_reply_sellbird_catches():
+def test_opt_out_line_can_use_any_wording_but_no_address():
     import pydantic
-    for bad in ('Reply "pass" and I\'ll stop.', "To opt out email optout@acme.com"):
+    for bad in ("To opt out email optout@acme.com",):
         with pytest.raises(pydantic.ValidationError):
             ComplianceConfig(opt_out_line=bad)
     for good in (LINE, "Reply STOP to opt out.", "Not a fit? Just reply with unsubscribe.",
-                 "Reply 'remove me' and you won't hear from me again."):
+                 "Reply 'remove me' and you won't hear from me again.",
+                 'Reply "pass" and I\'ll stop.'):
         assert ComplianceConfig(opt_out_line=good).opt_out_line == good
+
+
+@pytest.mark.asyncio
+async def test_a_reply_quoting_the_previous_default_footer_is_not_an_opt_out(state):
+    from sellbird.config import PREVIOUS_DEFAULT_OPT_OUT_LINE
+    status, _ = await _reply(state, "Sounds good, send times.\n\n> " + PREVIOUS_DEFAULT_OPT_OUT_LINE)
+    assert status != "opted_out"
 
 
 # ── Review round 3 ──
@@ -633,8 +645,11 @@ async def test_quoting_our_hebrew_footer_is_not_an_opt_out(state):
 
 def test_every_reply_an_opt_out_line_can_ask_for_is_caught():
     from sellbird.agents.handler import _opt_out_reason
-    from sellbird.config import HEBREW_OPT_OUT_WORDS, OPT_OUT_WORDS
-    for word in OPT_OUT_WORDS + HEBREW_OPT_OUT_WORDS:
+    from sellbird.config import (
+        FRENCH_OPT_OUT_WORDS, HEBREW_OPT_OUT_WORDS, OPT_OUT_WORDS, SPANISH_OPT_OUT_WORDS,
+    )
+    for word in (OPT_OUT_WORDS + HEBREW_OPT_OUT_WORDS + SPANISH_OPT_OUT_WORDS
+                 + FRENCH_OPT_OUT_WORDS):
         assert _opt_out_reason(word, word), word
 
 
@@ -645,10 +660,12 @@ def test_opt_out_line_can_ask_in_hebrew():
                  "השיבו במייל חוזר ״הסר״ ונסיר אתכם.", "ואם לא מתאים, פשוט ענו לא, תודה.",
                  'בלי לחץ: השיבו "הסר" ולא אפנה שוב.'):
         assert ComplianceConfig(opt_out_line=good).opt_out_line == good
+    # Any wording that says the emails stop; a link, a "click" or a plain
+    # sign-off ("thanks for reading!") still isn't an opt-out line.
+    assert ComplianceConfig(opt_out_line="ואם זה לא בשבילכם, תגידו לי ולא אכתוב שוב.")
+    with pytest.raises(pydantic.ValidationError):
+        ComplianceConfig(opt_out_line="תודה שקראתם!")
     for bad in (
-        "ואם זה לא בשבילכם, תגידו לי ולא אכתוב שוב.",   # names no reply Sellbird catches
-        'השיבו "הסרתי"',
-        "תודה שקראתם!",
         "להסרה לחצו כאן",
         'להסרה השיבו "הסר" או לחצו כאן',
         "להסרה: https://example.com/u",
@@ -800,6 +817,100 @@ def test_spanish_opt_out_lines_are_accepted():
         assert ComplianceConfig(opt_out_line=line).opt_out_line == line
 
 
+# ── French opt-outs ──
+
+@pytest.mark.parametrize("reply", [
+    "Non merci.", "non merci", "Non, merci beaucoup", "Bonjour, non merci. Bonne journée",
+    "ARRÊT", "Arrêt svp", "Désabonner", "Désabonnez-moi", "desabonnez moi s'il vous plaît",
+    "Je veux me désabonner.", "Comment me désinscrire?",
+    "Retirez-moi de votre liste.", "Enlevez-moi de la liste d'envoi svp", "Supprimez-moi.",
+    "Pouvez-vous me retirer de votre liste?", "Supprimez mon adresse de votre liste.",
+    "Ne m'écrivez plus.", "Ne m’écrivez plus.", "Ne me contactez plus svp",
+    "S'il vous plaît, ne m'écrivez plus.", "N'écrivez plus.",
+    "Ne m'envoyez plus de courriels.", "Ne m'envoyez plus rien.", "ne m'envoyez plus",
+    "Merci de ne plus m'écrire.", "Prière de ne plus me contacter", "Veuillez ne pas me relancer.",
+    "Arrêtez de m'écrire.", "Cessez de me contacter!", "Arrête de m'envoyer des courriels",
+    "Arrêtez vos envois", "Laissez-moi tranquille.",
+    "Je ne veux plus recevoir vos courriels.", "Je ne souhaite plus recevoir de messages.",
+    "Nous ne voulons pas être sollicités.",
+    "Pas intéressé.", "Pas intéressée, merci", "Je ne suis pas intéressé.", "Je suis pas intéressé",
+    "On n'est pas intéressés.", "Nous ne sommes pas intéressés pour le moment.",
+    "Ça ne m'intéresse pas.", "Ca m'interesse pas", "Ça ne nous intéresse pas du tout, merci.",
+    "Pas intéressé\n\nJean Exemple\nTél. 555-0100", "Pas intéressé\nEnvoyé de mon iPhone",
+])
+def test_french_opt_outs(reply):
+    assert _opt_out_reason(reply, reply) is not None
+
+
+@pytest.mark.parametrize("reply", [
+    "Oui ou non, merci de confirmer", "Non, merci à vous!", "Pourquoi non, merci",
+    "Non merci pour l'info, mais on aimerait un prix",
+    "Pas intéressé par le plan annuel, mais le mensuel oui.",
+    "Pas intéressé, mais mon associé l'est peut-être.",
+    "Pas intéressé par un contrat annuel.", "Pas intéressé à payer d'avance, mais parlons-en.",
+    "Si ça ne m'intéresse pas, je peux annuler?", "Vous n'êtes pas intéressé? Pas grave.",
+    "Mon associé n'est pas intéressé, mais moi oui.", "Ça m'intéresse, combien ça coûte?",
+    "Vous ne m'écrivez plus depuis mai?", "Il ne m'écrit plus.",
+    "Ne m'écrivez pas avant janvier.", "Ne me contactez pas le lundi.",
+    "Ne m'écrivez pas ici, écrivez-moi à ventes@acme.example",
+    "Ne me contactez pas par courriel, appelez-moi.",
+    "Retirez-moi la TPS svp", "Enlevez-moi le frais en double",
+    "Ne m'envoyez plus de factures papier.", "Arrêtez de m'envoyer les factures en double.",
+    "Je ne veux pas recevoir de factures papier",
+    "Ne me désabonnez pas.", "Je ne veux pas me désabonner",
+    "Nous voulons arrêter notre fournisseur actuel", "L'arrêt d'autobus est à côté",
+    "Envoyez-moi le prix",
+])
+def test_french_that_is_not_an_opt_out(reply):
+    assert _opt_out_reason(reply, reply) is None
+
+
+def test_a_long_french_reply_is_quick():
+    import time
+    text = "ne pas retirez-moi " * 20000
+    started = time.monotonic()
+    _opt_out_reason(text, text)
+    assert time.monotonic() - started < 2
+
+
+@pytest.mark.asyncio
+async def test_a_french_opt_out_reaches_the_handler(state):
+    status, _ = await _reply(state, "Non merci.")
+    assert status == "opted_out"
+
+
+def test_french_mobile_signature_doesnt_hide_a_bare_opt_out():
+    reply = "ARRÊT\n\nEnvoyé de mon iPhone"
+    assert _opt_out_reason(reply, reply)["rule"] == "only_words"
+
+
+def test_our_own_french_footer_quoted_back_is_not_an_opt_out():
+    line = "Pas intéressé? Répondez-moi simplement et je ne vous écrirai plus."
+    ours = OurText([line])
+    their = ours.remove(f"Ça m'intéresse, combien ça coûte?\n> {line}")
+    assert _opt_out_reason(their, "Ça m'intéresse, combien ça coûte?") is None
+
+
+def test_french_opt_out_lines_are_accepted():
+    for line in ("Pas intéressé? Répondez-moi simplement et je ne vous écrirai plus.",
+                 "Pas interesse? Repondez-moi simplement et je ne vous ecrirai plus.",
+                 "Répondez ARRÊT pour vous désabonner.",
+                 "Pour ne plus recevoir mes courriels, répondez « non merci ».",
+                 "Si ce n’est pas pour vous, dites-le-moi et je vous retirerai de ma liste.",
+                 "Vous préférez que je vous laisse tranquille? Un simple « non » suffit.",
+                 "Pas le bon moment? Dites-le et vous n'aurez plus de nouvelles de ma part."):
+        assert ComplianceConfig(opt_out_line=line).opt_out_line == line
+
+
+def test_french_lines_that_dont_say_it_stops_or_have_a_link_are_refused():
+    import pydantic
+    for bad in ("Merci de votre lecture!", "Bonne journée!",
+                "Cliquez ici pour vous désabonner.",
+                "Pour vous désabonner : https://example.com/u"):
+        with pytest.raises(pydantic.ValidationError):
+            ComplianceConfig(opt_out_line=bad)
+
+
 # ── Hebrew escalation ──
 
 @pytest.mark.asyncio
@@ -916,3 +1027,49 @@ def test_more_ways_to_say_a_hebrew_legal_threat(reply):
 def test_hyphens_and_near_words_dont_escalate(reply):
     from sellbird.agents.handler import _escalates, _flat
     assert not _escalates(_flat(reply))
+
+
+def test_an_opt_out_line_has_to_say_the_emails_can_stop():
+    import pydantic
+    for bad in ("Cheers!", "Have a great week.", "Thanks for reading, Jordan",
+                "Hope this helps."):
+        with pytest.raises(pydantic.ValidationError, match="stop these emails"):
+            ComplianceConfig(opt_out_line=bad)
+    for good in ("If this isn't for you, tell me and I'll stop reaching out.",
+                 "Wrong person? Let me know and you won't hear from me again.",
+                 "Not interested? Just say so and I won't follow up.",
+                 "Say the word and I'll take you off my list.",
+                 "Happy to never email you again, just reply.",
+                 'Responda "no, gracias" y no le escribiré más.',
+                 "Si no le interesa, dígamelo y dejaré de escribirle.",
+                 'השיבו "הסר" ולא אפנה אליכם שוב.'):
+        assert ComplianceConfig(opt_out_line=good).opt_out_line == good
+    # Leaving the line off is still the operator's choice.
+    assert ComplianceConfig(opt_out_line="").opt_out_line == ""
+
+
+# ── Italian opt-out line ──
+
+@pytest.mark.parametrize("line", [
+    "Non ti interessa? Rispondi pure e non ti scriverò più.",
+    "Non Le interessa? Mi basta una riga di risposta e non La contatterò più.",
+    "Se non volete ricevere altre email, rispondete e vi rimuovo dalla lista.",
+    "Scrivete STOP e non vi disturberò più.",
+    "Per non ricevere più mie email basta rispondere.",
+    "Rispondi \"disiscrivimi\" e smetterò di scriverti.",
+    "Per annullare l'iscrizione rispondi a questa email.",
+])
+def test_an_italian_opt_out_line_is_accepted(line):
+    assert ComplianceConfig(opt_out_line=line).opt_out_line == line
+
+
+@pytest.mark.parametrize("line", [
+    "Cordiali saluti",
+    "A presto!",
+    "Buona giornata e grazie per il tempo.",
+    "Un caro saluto da Roma",
+])
+def test_an_italian_sign_off_is_not_an_opt_out_line(line):
+    from pydantic import ValidationError
+    with pytest.raises(ValidationError):
+        ComplianceConfig(opt_out_line=line)

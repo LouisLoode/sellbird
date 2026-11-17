@@ -13,6 +13,7 @@ import sys
 import tempfile
 import uuid
 from collections import Counter
+from collections.abc import Sequence
 from datetime import date, datetime, timezone
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -20,23 +21,29 @@ from urllib.parse import urlsplit
 import aiosqlite
 import yaml
 from dotenv import load_dotenv
-from fastapi import FastAPI, Request
+from fastapi import APIRouter, FastAPI, Request
 from fastapi.responses import (
     HTMLResponse, JSONResponse, PlainTextResponse, Response,
 )
+from starlette.middleware import Middleware
+from starlette.routing import Mount
 
 logger = logging.getLogger("sellbird.dashboard")
 
+from sellbird import agent_policy  # noqa: E402
 from sellbird import dashboard_auth as auth  # noqa: E402
-from sellbird.paths import PROJECT_ROOT  # noqa: E402
+from sellbird.paths import PACKAGE_ROOT, PROJECT_ROOT, is_checkout  # noqa: E402
+from sellbird import storage  # noqa: E402
 from sellbird.pidfile import LOCK_FILE, loop_lock_held, pid_alive  # noqa: E402
 from sellbird.textio import read_user_text  # noqa: E402
+from sellbird.workspace_home import NotOnHosted, use_home  # noqa: E402
 DB_PATH = PROJECT_ROOT / "data" / "sellbird.db"
 ENV_FILE = PROJECT_ROOT / ".env"
 CONFIG_FILE = PROJECT_ROOT / "sellbird.yaml"
 PID_FILE = PROJECT_ROOT / "data" / "sellbird.pid"
 LOG_FILE = PROJECT_ROOT / "data" / "sellbird.log"
 TOKEN_FILE = PROJECT_ROOT / "data" / "dashboard-token"
+AGENT_TOKEN_FILE = PROJECT_ROOT / "data" / "agent-token"
 
 
 def _resolve_config_file() -> Path:
@@ -54,7 +61,41 @@ def _resolve_config_file() -> Path:
 # route except the static shell needs the token (see dashboard_auth).
 app = FastAPI(title="Sellbird Dashboard", docs_url=None, redoc_url=None, openapi_url=None)
 token_store = auth.TokenStore(TOKEN_FILE)
-app.add_middleware(auth.DashboardGuard, store=token_store)
+agent_token_store = auth.TokenStore(AGENT_TOKEN_FILE)
+# Innermost first: the guard (added next) sets the principal before this runs.
+app.add_middleware(agent_policy.AgentPolicy)
+app.add_middleware(auth.DashboardGuard, store=token_store, agent_store=agent_token_store)
+
+
+class home_middleware:
+    """A request runs in its app's home (``app.state.home``, see build_app).
+
+    Pure ASGI, so the ContextVar set here is seen by everything inside it:
+    the guard, async handlers and the sync handlers Starlette runs in its
+    threadpool. An app with no ``state.home`` sets nothing, and the default
+    home (the module globals) applies, which is every self-hosted install."""
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        home = None
+        if scope["type"] in ("http", "websocket"):
+            home = getattr(getattr(scope.get("app"), "state", None), "home", None)
+        if home is None:
+            await self.app(scope, receive, send)
+            return
+        with use_home(home):
+            await self.app(scope, receive, send)
+
+
+# Added last, so it is the outermost middleware.
+app.add_middleware(home_middleware)
+
+
+@app.exception_handler(NotOnHosted)
+async def _not_on_hosted(request: Request, exc: NotOnHosted):
+    return JSONResponse(exc.payload, status_code=409)
 
 # Sellbird process tracking
 _sellbird_process: subprocess.Popen | None = None
@@ -74,7 +115,7 @@ async def query_db(sql: str, params: tuple = ()) -> list[dict]:
     if not DB_PATH.exists():
         return []
     try:
-        async with aiosqlite.connect(str(DB_PATH)) as db:
+        async with storage.connect(str(DB_PATH)) as db:
             db.row_factory = aiosqlite.Row
             async with db.execute(sql, params) as cursor:
                 rows = await cursor.fetchall()
@@ -193,7 +234,8 @@ async def get_setup_status():
     # 1. Venv
     checks.append({
         "id": "venv", "label": "Python virtual environment",
-        "done": (PROJECT_ROOT / ".venv").is_dir(),
+        # An installed app (pipx) has no checkout venv to make.
+        "done": (not is_checkout(PACKAGE_ROOT)) or (PACKAGE_ROOT / ".venv").is_dir(),
         "required": True,
         "help": "Run: python3 -m venv .venv && source .venv/bin/activate && pip install -e .",
     })
@@ -217,13 +259,13 @@ async def get_setup_status():
     if provider == "gmail":
         provider_done = _has("GMAIL_CLIENT_ID", "GMAIL_CLIENT_SECRET") and \
             (PROJECT_ROOT / "data" / "gmail_token.json").is_file()
-        provider_help = ("Set GMAIL_CLIENT_ID/SECRET in Settings, then run "
-                         "'sellbird gmail auth' in your terminal.")
+        provider_help = ("Add your Google OAuth client ID and secret in Settings, then sign "
+                         "in on the Inboxes tab (or run 'sellbird gmail auth').")
     elif provider == "microsoft":
         provider_done = _has("M365_CLIENT_ID") and \
             (PROJECT_ROOT / "data" / "m365_token.json").is_file()
-        provider_help = ("Set the Microsoft 365 client and tenant IDs in Settings, then run "
-                         "'sellbird microsoft auth' in your terminal.")
+        provider_help = ("Add your Microsoft 365 client and tenant IDs in Settings, then sign "
+                         "in on the Inboxes tab (or run 'sellbird microsoft auth').")
     elif provider == "smtp":
         provider_done = _has("SMTP_HOST", "SMTP_USERNAME", "SMTP_PASSWORD")
         provider_help = "Enter your SMTP host, username, and password in Settings."
@@ -434,6 +476,11 @@ async def save_env_settings(request: Request):
             except Exception as e:
                 logger.warning("Failed to write .env: %s", e)
                 return {"success": False, "message": "Could not write .env file."}
+            # The sign-in clients take effect now, so the Inboxes tab can sign in
+            # without a restart (load_dotenv never overwrites a value already set).
+            for key in ("GMAIL_CLIENT_ID", "GMAIL_CLIENT_SECRET", "M365_CLIENT_ID", "M365_TENANT_ID"):
+                if key in updates:
+                    os.environ[key] = updates[key]
     return {"success": True}
 
 
@@ -503,6 +550,156 @@ async def trulyinbox_other():
     state = _state()
     await state.init_db()
     await ti.set_choice(state, "other")
+    return {"success": True}
+
+
+# ── Your offer: what every first email ends by offering (sellbird.offer) ──
+
+def _offer_config_file() -> Path:
+    """Where the offer is saved. The tracked sellbird.yaml template stays
+    untrained: your offer goes in the gitignored sellbird.local.yaml, which
+    then holds your whole config (as `sellbird train` does)."""
+    target = _resolve_config_file()
+    if target.name == "sellbird.yaml":
+        local = target.with_name("sellbird.local.yaml")
+        if not local.exists():
+            shutil.copyfile(target, local)
+        target = local
+    return target
+
+
+async def _offer_brain():
+    from sellbird.brain import Brain
+    from sellbird.config import load_config
+    config = load_config()
+    state = _state()
+    await state.init_db()
+    return Brain(state, config.brain), state, config
+
+
+@app.get("/api/offer")
+async def get_offer():
+    from sellbird.config import load_config
+    from sellbird.offer import offer_view
+    try:
+        return offer_view(load_config())
+    except Exception as e:
+        return JSONResponse({"error": f"Couldn't read your config: {e}"}, status_code=500)
+
+
+@app.post("/api/offer/suggest")
+async def suggest_offer():
+    """A few offers that fit your product. One model call; nothing is saved."""
+    from sellbird.offer import suggest_offers
+    try:
+        brain, _, config = await _offer_brain()
+        ideas = await suggest_offers(brain, config)
+    except Exception as e:
+        logger.warning(f"Offer suggestions failed: {e}")
+        return JSONResponse({"error": "Sellbird couldn't come up with offers just now. Try again."},
+                            status_code=502)
+    if not ideas:
+        return JSONResponse({"error": "Sellbird couldn't come up with offers just now. Try again."},
+                            status_code=502)
+    return {"ideas": ideas}
+
+
+@app.post("/api/offer/preview")
+async def preview_offer(request: Request):
+    """One real first email written with this offer. Nothing is saved or sent."""
+    from sellbird.offer import MAX_OFFER_CHARS, preview_email
+    body = await request.json() if request.headers.get("content-type", "").startswith("application/json") else {}
+    entry = " ".join(str((body or {}).get("entry") or "").split())[:MAX_OFFER_CHARS]
+    if not entry:
+        return JSONResponse({"ok": False, "message": "Write an offer first."}, status_code=400)
+    try:
+        brain, state, config = await _offer_brain()
+        return await preview_email(brain, state, config, entry)
+    except Exception as e:
+        logger.warning(f"Offer preview failed: {e}")
+        return JSONResponse({"ok": False, "message": "The preview failed. Try again."}, status_code=502)
+
+
+@app.post("/api/offer")
+async def save_offer_route(request: Request):
+    """Save the offer to product.offer.entry. The Writer reads it on its next run."""
+    from sellbird.offer import MAX_OFFER_CHARS, save_offer
+    body = await request.json() if request.headers.get("content-type", "").startswith("application/json") else {}
+    entry = " ".join(str((body or {}).get("entry") or "").split())[:MAX_OFFER_CHARS]
+    ideas = (body or {}).get("ideas")
+    ideas = [str(i) for i in ideas] if isinstance(ideas, list) else None
+    target = _offer_config_file()
+    try:
+        save_offer(target, entry, ideas)
+        from sellbird.offer import PROPOSED_KEY
+        state = _state()
+        await state.init_db()
+        await state.delete_setting(PROPOSED_KEY)
+    except Exception as e:
+        return JSONResponse({"success": False, "message": f"Couldn't save to {target.name}: {e}"},
+                            status_code=500)
+    return {"success": True, "entry": entry,
+            "message": "Saved. Every new first email ends with this offer." if entry
+                       else "Saved. With no offer, first emails end with a question."}
+
+
+@app.get("/api/company")
+async def get_company():
+    """Your company: everything Sellbird writes from, and any offer your agent proposed."""
+    from sellbird.config import load_config
+    from sellbird.offer import PROPOSED_KEY, company_view
+    try:
+        state = _state()
+        await state.init_db()
+        raw = await state.get_setting(PROPOSED_KEY)
+        proposed = json.loads(raw) if raw else None
+        return company_view(load_config(), PROJECT_ROOT, proposed)
+    except Exception as e:
+        return JSONResponse({"error": f"Couldn't read your config: {e}"}, status_code=500)
+
+
+@app.post("/api/company")
+async def save_company_route(request: Request):
+    """Save one edited section of Your company to the config file."""
+    from sellbird.offer import save_company
+    body = await request.json() if request.headers.get("content-type", "").startswith("application/json") else {}
+    section = str((body or {}).get("section") or "")
+    fields = (body or {}).get("fields")
+    if not isinstance(fields, dict) or not fields:
+        return JSONResponse({"success": False, "message": "Nothing to save."}, status_code=400)
+    try:
+        save_company(_offer_config_file(), section, fields)
+    except ValueError as e:
+        return JSONResponse({"success": False, "message": f"Not saved: {e}."}, status_code=400)
+    except Exception as e:
+        return JSONResponse({"success": False, "message": f"Couldn't save: {e}"}, status_code=500)
+    return {"success": True, "message": "Saved. New emails use it from the next draft."}
+
+
+@app.post("/api/offer/propose")
+async def propose_offer(request: Request):
+    """Your agent's proposed offer, waiting for you to use or dismiss it on
+    Your company. Proposing changes nothing that's sent."""
+    from sellbird.offer import MAX_OFFER_CHARS, PROPOSED_KEY
+    body = await request.json() if request.headers.get("content-type", "").startswith("application/json") else {}
+    entry = " ".join(str((body or {}).get("entry") or "").split())[:MAX_OFFER_CHARS]
+    why = " ".join(str((body or {}).get("why") or "").split())[:500]
+    if not entry:
+        return JSONResponse({"ok": False, "message": "An offer is required."}, status_code=400)
+    state = _state()
+    await state.init_db()
+    await state.set_setting(PROPOSED_KEY, json.dumps({"entry": entry, "why": why,
+                                                      "at": datetime.now(timezone.utc).isoformat()}))
+    return {"ok": True, "message": "Proposed. The user confirms it on the Your company tab "
+                                    "(dashboard → Your company → Your offer → Use this offer)."}
+
+
+@app.delete("/api/offer/propose")
+async def dismiss_proposed_offer():
+    from sellbird.offer import PROPOSED_KEY
+    state = _state()
+    await state.init_db()
+    await state.delete_setting(PROPOSED_KEY)
     return {"success": True}
 
 
@@ -726,7 +923,7 @@ async def add_feedback(request: Request):
     feedback_id = uuid.uuid4().hex[:12]
     try:
         DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-        async with aiosqlite.connect(str(DB_PATH)) as db:
+        async with storage.connect(str(DB_PATH)) as db:
             # Ensure the table exists so feedback works even on a fresh install
             await db.execute(
                 """CREATE TABLE IF NOT EXISTS feedback (
@@ -766,7 +963,14 @@ async def get_sellbird_status():
     """Check if Sellbird is currently running."""
     pid = _check_sellbird_pid()
     started = _sellbird_started_at.isoformat() if _sellbird_started_at else None
-    return {"running": pid is not None, "pid": pid, "started_at": started}
+    try:
+        state = _state()
+        await state.init_db()
+        paused = await state.get_setting("sending_paused") or ""
+    except Exception:
+        paused = ""
+    return {"running": pid is not None, "pid": pid, "started_at": started,
+            "sending_paused": paused}
 
 
 @app.post("/api/sellbird/start")
@@ -1379,6 +1583,17 @@ async def outbox_edit(item_id: str, request: Request):
         if item.get("kind") == "sequence" and footer and not text.rstrip().endswith(footer):
             checked = text.rstrip() + "\n\n" + footer  # as the Sender will send it
         gate = pre_send_check("reviewer@example.com", subject, checked)
+        from sellbird.email_style import style_problems
+        prospect = await state.get_prospect(item.get("prospect_id") or "")
+        names = [n for n in (getattr(prospect, "company", ""), getattr(prospect, "first_name", ""),
+                             getattr(prospect, "last_name", "")) if n]
+        style = style_problems(subject, text, shape=False, names=names,
+                               kind="reply" if item.get("kind") == "reply" else "cold")
+        if style:
+            return JSONResponse({"success": False,
+                                 "message": "The sender would hold this: the email "
+                                            + "; ".join(style)},
+                                status_code=400)
         if not gate:
             return JSONResponse({"success": False,
                                  "message": "The sender would have blocked this: "
@@ -1420,10 +1635,24 @@ def _sellbird_can_send() -> bool:
             return False
         if (email.provider or "").strip().lower() in NATIVE_PROVIDERS:
             provider = get_mail_provider(config, env)
-            return bool(provider and provider.is_configured())
+            return bool(provider and provider.is_configured()) or _extra_inboxes_connected()
         return bool(env.instantly_api_key)
     except Exception:
         return True
+
+
+def _extra_inboxes_connected() -> bool:
+    """Whether an inbox besides the main one is connected (sellbird inboxes):
+    Sellbird sends from it even while the main mailbox isn't signed in."""
+    import sqlite3
+    if not Path(DB_PATH).exists():
+        return False
+    try:
+        with sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True) as db:
+            row = db.execute("SELECT 1 FROM mailboxes WHERE state != 'retired' LIMIT 1").fetchone()
+    except sqlite3.Error:
+        return False   # no table yet: no extra inbox
+    return row is not None
 
 
 def _send_as() -> str:
@@ -1791,6 +2020,27 @@ CONVERSATION_FILTERS = {
     "closed": lambda c: c.get("status") == "closed",
     "all": lambda c: True,
 }
+
+
+@app.get("/api/offers/accepted")
+async def get_offers_accepted():
+    """People who said yes to your offer, newest first, with what the handoff
+    (sellbird.handoff) answered, so you or your coding agent can deliver it."""
+    rows = await query_db("""
+        SELECT c.id AS conversation_id, c.status, c.updated_at, c.prospect_id,
+               p.first_name, p.last_name, p.email, p.title, p.company, p.company_id
+        FROM conversations c LEFT JOIN prospects p ON c.prospect_id = p.id
+        WHERE c.intent = 'accepted_offer'
+        ORDER BY c.updated_at DESC LIMIT 100
+    """)
+    for row in rows:
+        done = await query_db("SELECT value FROM settings WHERE key = ?",
+                              ("handoff:" + str(row.get("prospect_id") or ""),))
+        try:
+            row["handoff"] = json.loads(done[0]["value"]) if done else None
+        except (TypeError, ValueError, KeyError):
+            row["handoff"] = None
+    return {"accepted": rows}
 
 
 @app.get("/api/conversations")
@@ -2928,6 +3178,50 @@ def dashboard_url(host: str = "127.0.0.1", port: int = 5555) -> str:
     return f"http://{name}:{port}/#token={token_store.get()}"
 
 
+# Which dashboard answers on this port: a random id per process, never the
+# token. The MCP server checks it against data/dashboard.json before it sends
+# the agent token anywhere (dashboard_auth lets it through unauthenticated).
+INSTANCE_ID = uuid.uuid4().hex
+
+
+@app.get("/api/instance")
+async def get_instance():
+    return {"instance": INSTANCE_ID}
+
+
+from sellbird.inbox_routes import router as _inbox_router  # noqa: E402
+
+app.include_router(_inbox_router)
+
+
+# ── Extensions (sellbird.extensions): their routes, after every built-in one,
+# so an extension can add paths but never replace one. ──
+from sellbird import extensions as _extensions  # noqa: E402
+
+for _router in _extensions.registry().routers:
+    app.include_router(_router)
+
+
+def build_app(*, guard: Middleware | None = None, routers: Sequence[APIRouter] = ()) -> FastAPI:
+    """A fresh app serving the module-level ``app``'s routes, middleware and
+    exception handlers, for a server that runs Sellbird for someone else.
+
+    ``routers`` come first, so they win over a built-in route on the same
+    path. The built-in routes are mounted live, not copied: a route added to
+    ``app`` later still reaches every built app. ``guard`` takes
+    ``auth.DashboardGuard``'s place in the middleware stack (a server's own
+    sign-in instead of the dashboard token). Set ``state.home`` on the result
+    to run its requests in that home."""
+    new = FastAPI(title=app.title, docs_url=None, redoc_url=None, openapi_url=None)
+    for router in routers:
+        new.include_router(router)
+    new.router.routes.append(Mount("", app=app.router))
+    new.user_middleware = [guard if guard is not None and m.cls is auth.DashboardGuard else m
+                           for m in app.user_middleware]
+    new.exception_handlers.update(app.exception_handlers)
+    return new
+
+
 def start_dashboard(host: str = "127.0.0.1", port: int = 5555):
     """Start the dashboard server (loopback only, token required)."""
     import uvicorn
@@ -2944,5 +3238,10 @@ def start_dashboard(host: str = "127.0.0.1", port: int = 5555):
     if os.name == "nt":
         print("  Windows: the token file is protected by your folder's permissions,")
         print("  not POSIX file modes.\n")
-    uvicorn.run(app, host=bind, port=port, log_level="warning",
-                proxy_headers=False, server_header=False, date_header=False)
+    from sellbird import dashboard_instance
+    dashboard_instance.write(DB_PATH.parent, host=bind, port=port, instance=INSTANCE_ID)
+    try:
+        uvicorn.run(app, host=bind, port=port, log_level="warning",
+                    proxy_headers=False, server_header=False, date_header=False)
+    finally:
+        dashboard_instance.remove(DB_PATH.parent, instance=INSTANCE_ID)

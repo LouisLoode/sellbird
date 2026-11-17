@@ -14,6 +14,7 @@ import logging
 from html import unescape as html_unescape
 import random
 import re
+import unicodedata
 from datetime import date, datetime, timedelta, timezone
 from urllib.parse import urljoin, urlparse
 
@@ -135,6 +136,28 @@ MAX_BOARD_ROLES = 5
 CONTACT_PATHS = ("/contact", "/contact-us", "/get-a-quote", "/free-estimate",
                  "/request-estimate", "/quote")
 
+# Accented letters folded to their base letter one for one ("é" -> "e",
+# "Ç" -> "C"), so French text matches ASCII patterns and a match's span is
+# the same in the original: "Hélène Côté, présidente" reads as "Helene Cote,
+# presidente". Latin-1 and Latin Extended-A/B only; anything else is kept.
+_FOLD_TABLE = {}
+for _cp in range(0xC0, 0x250):
+    _d = unicodedata.normalize("NFD", chr(_cp))
+    if len(_d) > 1 and ord(_d[0]) < 128 and all(unicodedata.combining(c) for c in _d[1:]):
+        _FOLD_TABLE[_cp] = _d[0]
+del _cp, _d
+
+
+def fold_accents(text: str) -> str:
+    """Same length, accents dropped. Run text through ``unicodedata``'s NFC
+    first if it may hold decomposed accents (``nfc``)."""
+    return (text or "").translate(_FOLD_TABLE)
+
+
+def nfc(text: str) -> str:
+    return unicodedata.normalize("NFC", text or "")
+
+
 # Words that are never part of a person's name. Without this, headings like
 # "Request Service", "Baker History" and "Commercial Services" pass a
 # Firstname-Lastname regex and become contacts — the single most common
@@ -157,12 +180,13 @@ scope alignment implementation consistency communication process driven
 focused structured
 équipe equipe notre nos accueil propos mentions légales legales recrutement
 carrières carrieres offres emploi actualités actualites presse tarifs plateforme
+chauffage climatisation ventilation refrigeration thermopompe thermopompes
+climatiseur climatiseurs fournaise fournaises plomberie electricite toiture
+entretien reparation reparations urgence soumission soumissions estimation
+residentiel residentielle commercial commerciale industriel industrielle
+produits produit garantie garanties financement subventions subvention
+realisations accueil equipe equipes propos joindre contactez
 """.split())
-
-# Name letters: ASCII plus the accented Latin letters French, Spanish and
-# German names carry ("Hélène", "Éric", "Müller"). re has no \p{Lu}.
-_UP = "A-ZÀ-ÖØ-ÞŒ"
-_LO = "a-zß-öø-ÿœ"
 
 # Tokens that are words, not names, whatever the vertical: abstract nouns
 # ("Scope Alignment", "Board Communication") and shouted acronyms ("HOA").
@@ -173,7 +197,7 @@ def _is_name_token(token: str, surname: bool = False) -> bool:
     """``surname``: the last word of a name, which French sites write in
     capitals ("Claire DUVAL"); anywhere else a shouted word is an acronym."""
     from sellbird.collectors.people import upper_surname_ok
-    for part in token.split("-"):
+    for part in fold_accents(token).split("-"):
         bare = part.strip(".,'")
         low = bare.lower()
         if low in NON_NAME_WORDS or _NOUN_SUFFIX.search(low):
@@ -191,7 +215,7 @@ def _is_name(tokens: list[str]) -> bool:
 # Block-level tags separate a name, its title, and the bio that follows; the
 # first text chunk after the name heading is the title, nothing further.
 _BLOCK_BREAK = re.compile(r"(?i)<(?:/?(?:p|div|li|ul|ol|section|article|td|tr)\b[^>]*|br\s*/?)>")
-_CONNECTORS = frozenset("of and the for & to in at".split())
+_CONNECTORS = frozenset("of and the for & to in at de du des la le et en au aux a".split())
 
 
 def _title_chunks(raw_after: str) -> list[str]:
@@ -214,7 +238,10 @@ def _reads_like_title(text: str) -> bool:
     words = text.split()
     if not words or len(words) > 10:
         return False
-    lower = [w for w in words[1:] if w[:1].islower() and w.lower() not in _CONNECTORS]
+    # "Directrice des ventes et du service" is a title: French joins its
+    # words with lower-case articles.
+    lower = [w for w in words[1:] if w[:1].islower() and w.lower() not in _CONNECTORS
+             and not re.match(r"(?i)^[ld]['’]", w)]
     return len(lower) <= 2 and title_looks_like_role(text)
 
 DECISION_MAKER_TITLES = (
@@ -223,9 +250,10 @@ DECISION_MAKER_TITLES = (
     "office manager", "marketing director", "marketing manager",
     "director of marketing", "vice president", "vp ", "managing director",
     "chief", "director",
-    # French ("fondateur" also covers co-fondateur and cofondateur)
-    "fondateur", "fondatrice", "président", "gérant", "pdg", "dirigeant",
-    "directeur", "directrice",
+    # French (Québec), accents folded: propriétaire, président(e), PDG,
+    # fondateur/fondatrice, directeur/directrice, gérant(e), associé(e).
+    "proprietaire", "president", "pdg", "fondat", "directeur", "directrice",
+    "gerant", "associe",
 )
 
 
@@ -237,9 +265,13 @@ ROLE_HINT = re.compile(
     r"vice president|vp|executive|lead|head of|chief|proprietor|attorney|lawyer|"
     r"dentist|orthodontist|periodontist|endodontist|hygienist|dds|dmd|esq|cpa|"
     r"administrator|paralegal|associate|co-?owner|co-?founder|"
-    r"co-?fondat(?:eur|rice)s?|fondat(?:eur|rice)s?|présidente?|pdg|dg|gérante?|"
-    r"directeur|directrice|dirigeante?|responsable|associée?|ingénieure?|"
-    r"développeu(?:r|se)|chef de projet)\b", re.I)
+    # French (Québec), matched with accents folded
+    r"co-?proprietaire|proprietaire|presidente?|pdg|p\.-?d\.g|co-?fondat(?:eur|rice)|fondat(?:eur|rice)|"
+    r"directeur|directrice|gerante?|gestionnaire|associee?|adjointe?|technicien(?:ne)?|"
+    r"estimat(?:eur|rice)|representante?|conseill(?:er|ere)|coordonnat(?:eur|rice)|contremaitre|"
+    r"superviseure?|responsable|chargee?|ventes|comptable|administrat(?:eur|rice)|ingenieure?|"
+    r"frigoriste|mecanicien(?:ne)?|installat(?:eur|rice)|repartit(?:eur|rice)|secretaire|"
+    r"receptionniste)\b", re.I)
 
 
 def title_looks_like_role(text: str) -> bool:
@@ -248,7 +280,7 @@ def title_looks_like_role(text: str) -> bool:
     A name with no role nearby is usually a nav link or a page heading, not
     a person — requiring a role is the cheapest high-precision filter.
     """
-    return bool(ROLE_HINT.search(text[:160]))
+    return bool(ROLE_HINT.search(fold_accents(text[:160])))
 
 
 def _strip_code(html: str) -> str:
@@ -1256,7 +1288,10 @@ class ProfileCollector:
             drop_quoted, people_from_lines, split_person_name, title_names_other_org,
         )
 
-        text_html = _strip_code(drop_quoted(html))
+        text_html = _strip_code(drop_quoted(nfc(html)))
+        # Matched with accents folded (same length), read from the original:
+        # "Hélène Côté" passes the Firstname Lastname test as "Helene Cote".
+        folded_html = fold_accents(text_html)
         people, seen = [], set()
 
         def add(first, last, title, full_name=""):
@@ -1270,26 +1305,26 @@ class ProfileCollector:
                 "first_name": first, "last_name": last,
                 "full_name": full_name or f"{first} {last}",
                 "title": title[:80],
-                "is_decision_maker": any(t in title.lower() for t in DECISION_MAKER_TITLES),
+                "is_decision_maker": any(t in fold_accents(title.lower()) for t in DECISION_MAKER_TITLES),
             })
 
         # Name in a heading, title in the nearby text.
         # Tag names match any case; the NAME must not — under a blanket (?i)
         # "Customer care" passes the Firstname Lastname capitalisation test.
         for m in re.finditer(
-            rf"(?s)<((?i:h[1-5]|strong|b))[^>]*>\s*((?:Dr\.?\s+)?[{_UP}][{_LO}'\-]+(?:\s+[{_UP}]\.?)?"
-            rf"(?:\s+(?:[{_UP}][{_UP}{_LO}'\-]+|van|von|de|der|del|la|le|di|da|du)){{1,3}}"
+            r"(?s)<((?i:h[1-5]|strong|b))[^>]*>\s*((?:Dre?\.?\s+)?[A-Z][a-z'’\-]+(?:\s+[A-Z]\.?)?"
+            r"(?:\s+(?:[A-Z][a-zA-Z'’\-]+|van|von|de|der|del|du|la|le|di|da)){1,3}"
             r"(?:,?\s+(?:DDS|DMD|MD|Esq\.?|CPA|Jr\.?|Sr\.?|II|III))?)\s*</(?i:\1)>(?=(.{0,220}))",
-            text_html
+            folded_html
         ):
             # NOTE the lookahead above: capturing the trailing context normally
             # would CONSUME it, so finditer would skip every person whose entry
             # fell inside the previous person's 220-char window.
-            name = re.sub(r"\s+", " ", m.group(2)).strip()
+            name = re.sub(r"\s+", " ", text_html[m.start(2):m.end(2)]).strip()
             # Bound the context at the NEXT heading, in raw HTML, before
             # stripping tags — otherwise one member's role bleeds into the
             # next member's entry.
-            raw_after = m.group(3)
+            raw_after = text_html[m.start(3):m.end(3)]
             nxt = re.search(r"(?i)<(h[1-5]|strong|b)\b", raw_after)
             if nxt:
                 raw_after = raw_after[: nxt.start()]
@@ -1313,7 +1348,7 @@ class ProfileCollector:
                           if _reads_like_title(c)), "")
             if not title:
                 continue
-            add(split[0], split[1], title, re.sub(r"(?i)^dr\.?\s+", "", name))
+            add(split[0], split[1], title, re.sub(r"(?i)^dre?\.?\s+", "", name))
         # Name and title on consecutive lines, or "Name, Title" on one.
         for p in people_from_lines(html, domain, site_name):
             if _is_name(p["first_name"].split() + p["last_name"].split()):

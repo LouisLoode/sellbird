@@ -3,8 +3,12 @@
 import logging
 import os
 import re
+import unicodedata
+from contextlib import contextmanager
+from contextvars import ContextVar
 from datetime import date as _date, time as _time
 from pathlib import Path
+from typing import Iterator
 
 import yaml
 
@@ -43,7 +47,12 @@ class PersonaConfig(BaseModel):
 
 class OfferConfig(BaseModel):
     primary: str = ""
+    # What email 1 offers: free, useful, and something you can really deliver
+    # ("a mockup of your homepage with online booking"). The Writer builds the
+    # first email around it. `sellbird train` suggests entry_ideas and fills
+    # entry from the first when it's empty.
     entry: str = ""
+    entry_ideas: list[str] = []
     goal: str = "book_call"  # book_call, start_trial, get_reply
     booking_method: str = "calendar_link"  # calendar_link, suggest_times, ask_preference
     booking_url: str = ""
@@ -294,10 +303,20 @@ class EmailChannelConfig(BaseModel):
     # SMTP+IMAP mailbox: AgentMail, Fastmail, ...)
     provider: str = "instantly"
     max_daily_sends: int = 50
+    # Each extra sending inbox's daily cold-email cap (sellbird inboxes),
+    # under the warmup ramp from the day that inbox started warming. The
+    # main mailbox keeps max_daily_sends and warmup.start_date, and
+    # max_daily_sends stays the ceiling on everything sent in a day.
+    per_inbox_daily_cap: int = 30
     # When True, also send to catch-all ("risky") domains, not just verified
     # mailboxes. Off by default — catch-alls accept everything, so a bad
     # guess still bounces.
     send_to_risky: bool = False
+    # Don't write for prospects scored below this (0-100, Scout's fit
+    # score). 0, the default, writes for everyone with a deliverable
+    # address, as before. Raising it keeps Claude calls (and sends) for the
+    # prospects that match the ICP best.
+    min_write_score: int = 0
     # Native providers queue mail for approval. Instantly cannot use that
     # outbox, so it holds campaigns and escalates replies while this is true.
     # Set false explicitly for full autopilot once you trust the output.
@@ -314,9 +333,16 @@ class EmailChannelConfig(BaseModel):
     # France or a French-speaking region), English to everyone else. "en" or
     # "fr" writes every email in that language. See sellbird/language.py.
     language: str = "auto"
+    # Your own phone numbers. On autopilot, an email giving any other number
+    # waits in the Outbox (a planted "call this number instead" can't go out).
+    phone_numbers: list[str] = []
     # Kill switch: pause all sending when bounces exceed this fraction of
     # sent mail (measured over the trailing sends). 0 disables the switch.
     max_bounce_rate: float = 0.05
+    # false = a campaign stages only its first email. Follow-ups (steps 2 and
+    # 3) are not prepared, so none can go out to someone who never answered;
+    # a reply is still read and answered as usual. Gmail/Microsoft/SMTP only.
+    follow_ups: bool = True
     # New domain? Ramp cold email up slowly (see WarmupConfig). Native
     # providers only: Instantly has its own warmup and per-account limits.
     warmup: WarmupConfig = WarmupConfig()
@@ -357,6 +383,13 @@ class EmailChannelConfig(BaseModel):
     def _sends_non_negative(cls, v: int) -> int:
         if v < 0:
             raise ValueError("max_daily_sends must be >= 0")
+        return v
+
+    @field_validator("per_inbox_daily_cap")
+    @classmethod
+    def _per_inbox_cap_range(cls, v: int) -> int:
+        if not 1 <= v <= 500:
+            raise ValueError("per_inbox_daily_cap must be between 1 and 500")
         return v
 
     def cold_daily_cap(self, today: _date | None = None) -> int:
@@ -408,6 +441,16 @@ class ChannelsConfig(BaseModel):
 
 
 PRECLEARED_ADDRESS_SOURCES = ("published", "bought", "scraped", "given", "unknown")
+# Where a sender can be based for the Precleared check: the countries whose
+# cold-email rules Precleared applies (UK, US, Canada, Germany, France,
+# Australia, Ireland, the Netherlands, Spain, Italy, Latvia, the UAE, Egypt
+# and Qatar). The check itself decides by the recipient's country; this
+# list only gates sender_country in the config and in setup.
+PRECLEARED_SENDER_COUNTRIES = (
+    "GB", "US", "CA", "DE", "FR", "AU", "IE", "NL", "ES", "IT", "LV", "AE", "EG", "QA",
+)
+# Common spellings read as their two-letter codes.
+COUNTRY_ALIASES = {"UK": "GB", "USA": "US", "UAE": "AE"}
 
 
 def normalize_prospect_country(v) -> str:
@@ -422,7 +465,7 @@ def normalize_prospect_country(v) -> str:
             'ON into true/false, so quote the code, e.g. prospect_country: "NO".'
         )
     v = str(v or "").strip().upper()
-    v = {"UK": "GB", "USA": "US"}.get(v, v)
+    v = COUNTRY_ALIASES.get(v, v)
     if v and not (len(v) == 2 and v.isascii() and v.isalpha()):
         raise ValueError(
             f"'{v}' is not a valid prospect_country. Use a two-letter "
@@ -435,13 +478,17 @@ class PreclearedConfig(BaseModel):
     """Optional per-recipient cold-email check through Precleared.
 
     Off by default. When on, each new recipient is checked once, before the
-    first cold email, against UK PECR, US CAN-SPAM, Canada's CASL, Germany's
-    UWG and France's rules. Any verdict other than ok_to_email holds the
-    email back with the reason. See sellbird/integrations/precleared.py.
+    first cold email, under the cold-email rules of the recipient's country
+    (UK PECR, US CAN-SPAM, Canada's CASL, Germany's UWG, France's CPCE and
+    the other countries in PRECLEARED_SENDER_COUNTRIES). Any verdict other
+    than ok_to_email holds the email back with the reason. See
+    sellbird/integrations/precleared.py.
     """
 
     enabled: bool = False
-    # Where your business is based: GB or US. Required when enabled.
+    # Where your business is based, as a two-letter code from
+    # PRECLEARED_SENDER_COUNTRIES (GB, US, CA, DE, FR, AU, IE, NL, ES, IT, LV,
+    # AE, EG or QA). Required when enabled.
     sender_country: str = ""
     # Where prospect addresses come from, in Precleared's terms. Sellbird
     # builds most addresses from a learned pattern, so the honest default
@@ -457,7 +504,8 @@ class PreclearedConfig(BaseModel):
     @field_validator("sender_country", mode="before")
     @classmethod
     def _upper_country(cls, v) -> str:
-        return str(v or "").strip().upper()
+        v = str(v or "").strip().upper()
+        return COUNTRY_ALIASES.get(v, v)
 
     @field_validator("address_source", mode="before")
     @classmethod
@@ -477,43 +525,82 @@ class PreclearedConfig(BaseModel):
 
     @model_validator(mode="after")
     def _country_when_enabled(self):
-        if self.enabled and self.sender_country not in ("GB", "US"):
+        if self.enabled and self.sender_country not in PRECLEARED_SENDER_COUNTRIES:
             raise ValueError(
-                "compliance.precleared.sender_country must be GB or US "
-                "when the check is enabled."
+                "compliance.precleared.sender_country must be one of "
+                f"{', '.join(PRECLEARED_SENDER_COUNTRIES)} when the check is enabled."
             )
         return self
 
 
-DEFAULT_OPT_OUT_LINE = 'Not interested? Reply "no thanks" and I won\'t email again.'
+DEFAULT_OPT_OUT_LINE = "Not interested? Just let me know and I won't email you again."
 # Under an email written in French (see sellbird/language.py).
 DEFAULT_OPT_OUT_LINE_FR = "Pas intéressé ? Répondez « non merci » et je ne vous écrirai plus."
-# The replies the Handler always honours as an opt-out on their own; an
-# opt_out_line must ask for one of them ("Reply STOP", 'reply "no thanks"').
+# The default before any wording was allowed: emails already sent carry it, so a
+# reply quoting it is still recognised as our text.
+PREVIOUS_DEFAULT_OPT_OUT_LINE = 'Not interested? Reply "no thanks" and I won\'t email again.'
+# Replies the Handler honours as an opt-out by rule, before the model reads them.
+# The opt-out line itself can use any wording: the model reads every reply for a
+# request to stop, however it is put.
 OPT_OUT_WORDS = ("no thanks", "no thank you", "unsubscribe", "stop", "remove me",
                  "opt out")
-# The same in Hebrew ('השיבו "הסר"', 'תגידו לי "לא תודה"').
 HEBREW_OPT_OUT_WORDS = ("הסר", "הסירו", "הסרה", "לא תודה", "הסירו אותי", "תורידו אותי")
-# The same in Spanish ('Responda "no, gracias"', 'Responda BAJA').
 SPANISH_OPT_OUT_WORDS = ("no gracias", "baja", "darme de baja")
-_OPT_OUT_WORD_RE = "(?:" + "|".join(
-    r"[\s,]+".join(map(re.escape, w.split()))
-    for w in OPT_OUT_WORDS + HEBREW_OPT_OUT_WORDS + SPANISH_OPT_OUT_WORDS) + ")"
-_ASKS_FOR_OPT_OUT_RE = re.compile(
-    r"\b(?:reply(?:\s+with)?|(?:responda|responde|respondan|conteste|contesta|escriba)(?:\s+con)?)"
-    r"\s*[\"'“‘]?\s*" + _OPT_OUT_WORD_RE + r"\b", re.IGNORECASE)
-# The French replies the Handler honours on their own, and the line asking for one.
-OPT_OUT_WORDS_FR = ("non merci", "stop", "désinscription", "désabonnement")
-_ASKS_FOR_OPT_OUT_FR_RE = re.compile(
-    r"\br[ée]pond(?:ez|re|s)(?:\s+(?:simplement|juste|par))*\s*[«\"'“‘]?\s*(?:"
-    + "|".join(re.escape(w) for w in OPT_OUT_WORDS_FR) + r")\b", re.IGNORECASE)
-# Reply / answer / write / tell me, then a few words at most ("במייל חוזר").
-_ASKS_FOR_OPT_OUT_HE_RE = re.compile(
-    r"(?<!\w)ו?(?:השיב[וי]?|השב|תשיב[וי]?|ענ[הוי]|תענ[הוי]|כתוב|כתב[וי]|תכתוב|תכתב[וי]"
-    r"|הגב|הגיב[וי]|תגיב[וי]?|שלח[וי]?|תשלח[וי]?|תגיד[וי]?|אמור|אמר[וי])"
-    r"(?:\s+[^\s\"'׳״“”‘’]+){0,3}?"
-    r"\s*[\"'׳״“”‘’]?\s*" + _OPT_OUT_WORD_RE + r"(?!\w)",
+FRENCH_OPT_OUT_WORDS = ("non merci", "non, merci", "arrêt", "désabonner", "désabonnement",
+                        "désabonnez-moi", "retirez-moi")
+# Wording that tells people the emails can stop, in any phrasing. An
+# opt_out_line must say so somehow: one that reads like a sign-off ("Cheers!")
+# gives nobody a way out, which is worse than leaving the line off on purpose.
+_SAYS_IT_STOPS_RE = re.compile(
+    r"\b(?:stop|unsubscribe|opt[\s-]?out|remove|no\s+thanks|not\s+interested"
+    r"|leave\s+you\s+(?:be|alone)|take\s+you\s+off|off\s+(?:my|our|the)\s+list"
+    r"|hear\s+from\s+(?:me|us)|no\s+more\s+e-?mails?"
+    r"|won[\'’]?t\s+(?:\w+\s+){0,2}(?:e-?mail|write|contact|reach|bother|follow|message|send)"
+    r"|(?:not|never)\s+(?:\w+\s+){0,2}(?:e-?mail|contact|write|message)\w*\s+(?:you\s+)?again)",
     re.IGNORECASE)
+_SAYS_IT_STOPS_HE_RE = re.compile(
+    r"(?:הסר|להסיר|הסירו|הסרה|נסיר|לא,?\s+תודה|להפסיק|אפסיק|תורידו|לא\s+אפנה|לא\s+אכתוב|לא\s+אשלח)")
+_SAYS_IT_STOPS_ES_RE = re.compile(
+    r"(?:\bbaja\b|no,?\s+gracias|dejar[ée]?\s+de|dejo\s+de|no\s+(?:le|te|les)\s+(?:escribir|volver|molestar)"
+    r"|no\s+volver[ée]|eliminar|quitar|\bparar\b)",
+    re.IGNORECASE)
+_SAYS_IT_STOPS_IT_RE = re.compile(
+    r"(?:\bnon\s+(?:ti|vi|le)\s+(?:scriver[òo]|scrivo|contatter[òo]|contatto|disturber[òo]|disturbo"
+    r"|mander[òo]|mando|invier[òo]|invio)\b"
+    r"|\bnon\s+(?:ricever\w*|vuoi\s+ricevere|volete\s+ricevere)\b"
+    r"|\b(?:disiscri\w+|rimuov\w+|rimozione|cancell\w+|togli\w+)"
+    r"|\bannull\w*\s+l[’']?\s*iscrizione"
+    r"|\bsmetto\s+di\b|\bsmetter[òo]\s+di\b"
+    r"|\bnon\s+(?:ti\s+|vi\s+|le\s+)?interess\w+|\bnon\s+interessat\w+|\bstop\b)",
+    re.IGNORECASE)
+# French, matched with accents removed (see _fold_accents): "Pas intéressé?
+# Répondez-moi et je ne vous écrirai plus", "Répondez ARRÊT pour vous désabonner".
+_SAYS_IT_STOPS_FR_RE = re.compile(
+    r"(?:desabonn|desinscri|\barret(?:e|er|ez|erai|erons)?\b|\bnon,?\s+merci\b"
+    r"|\bpas\s+interess"
+    r"|\bn(?:e\s+|')(?:vous\s+|t'|te\s+)?(?:ecri|contact|relanc|envo|enverr|derang|sollicit"
+    r"|importun|recevr)\w*\s+(?:plus|jamais|pas\s+(?:a|de)\s+nouveau)\b"
+    r"|\bne\s+plus\s+(?:jamais\s+)?(?:vous\s+|t'|te\s+|m'|me\s+)?(?:ecrire|contacter|relancer"
+    r"|recevoir|solliciter|deranger|etre\s+(?:contacte|sollicite|relance))"
+    r"|\bne\s+(?:voulez|souhaitez|desirez|veux|veut)\s+(?:plus|pas)\s+(?:\w+\s+){0,2}?"
+    r"(?:recevoir|courriels?|messages?|nouvelles)"
+    r"|\b(?:retir|enlev|supprim|ray)\w*\s+(?:\w+\s+){0,3}?(?:de|d'|des)\s*"
+    r"(?:(?:la|ma|notre|votre|vos|nos|mes|cette|ses)\s+)?(?:listes?|envois?|base|infolettre|courriels)"
+    r"|\blaiss\w*\s+tranquilles?"
+    r"|\bplus\s+(?:jamais\s+)?(?:de\s+)?(?:courriels?|messages?|nouvelles)\s+de\s+(?:ma|notre)\s+part)",
+    re.IGNORECASE)
+# "Click" in French: "cliquez ici pour vous désabonner".
+_FRENCH_CLICK_RE = re.compile(r"\bcliqu(?:ez|er|e)\b", re.IGNORECASE)
+
+
+def _fold_accents(text: str) -> str:
+    """Latin accents dropped and curly apostrophes made straight, so French
+    reads the same typed with or without them."""
+    text = text.replace("\u2019", "'").replace("\u2018", "'")
+    return "".join(c for c in unicodedata.normalize("NFD", text)
+                   if not (unicodedata.combining(c) and ord(c) < 0x370))
+
+
 # "Click" in Hebrew: a footer has no link to click.
 _HEBREW_CLICK_RE = re.compile(r"(?<!\w)ו?(?:לחצו|לחצי|לחץ\s+(?:כאן|על)|הקליקו|הקליקי|הקלק)(?!\w)")
 
@@ -524,9 +611,8 @@ class ComplianceConfig(BaseModel):
     # CAN-SPAM requires a postal address you receive mail at (a street
     # address, PO box or virtual mailbox) and a working way to opt out.
     postal_address: str = ""
-    # Must ask for wording Sellbird recognises as an opt-out (OPT_OUT_WORDS,
-    # HEBREW_OPT_OUT_WORDS).
-    # "" leaves it off (and sellbird warns).
+    # Any wording that tells people they can opt out by replying. "" leaves it
+    # off (and sellbird warns).
     opt_out_line: str = DEFAULT_OPT_OUT_LINE
     # The same under an email written in French; must ask for a French
     # opt-out reply ("Répondez « non merci »", "Répondez STOP").
@@ -579,18 +665,20 @@ class ComplianceConfig(BaseModel):
         lowered = v.lower()
         if not v:
             return v
+        folded = _fold_accents(v)
         if (any(bit in lowered for bit in ("http", "www.", "click", "@"))
-                or _HEBREW_CLICK_RE.search(v)):
+                or _HEBREW_CLICK_RE.search(v) or _FRENCH_CLICK_RE.search(folded)):
             raise ValueError(
                 "opt_out_line can't contain a link or an email address: cold email "
                 "allows one link, and opting out must be as simple as replying."
             )
-        if not (_ASKS_FOR_OPT_OUT_RE.search(v) or _ASKS_FOR_OPT_OUT_HE_RE.search(v)):
+        if not (_SAYS_IT_STOPS_RE.search(v) or _SAYS_IT_STOPS_HE_RE.search(v)
+                or _SAYS_IT_STOPS_ES_RE.search(v) or _SAYS_IT_STOPS_IT_RE.search(v)
+                or _SAYS_IT_STOPS_FR_RE.search(folded)):
             raise ValueError(
-                "opt_out_line must ask for a reply Sellbird recognises as an opt-out, "
-                'e.g. Reply "no thanks" / Reply STOP, in Hebrew השיבו "הסר", or in Spanish Responda BAJA. Recognised: '
-                + ", ".join(f'"{w}"' for w in OPT_OUT_WORDS + HEBREW_OPT_OUT_WORDS
-                            + SPANISH_OPT_OUT_WORDS) + "."
+                "opt_out_line doesn't tell people they can stop these emails. Say so in "
+                "any words (\"Not interested? Just let me know and I won't email you "
+                "again.\"), or set it to \"\" to leave the line off."
             )
         return v
 
@@ -603,11 +691,11 @@ class ComplianceConfig(BaseModel):
             return v
         if any(bit in v.lower() for bit in ("http", "www.", "@")):
             raise ValueError("opt_out_line_fr can't contain a link or an email address.")
-        if not _ASKS_FOR_OPT_OUT_FR_RE.search(v):
+        folded = _fold_accents(v)
+        if not (_SAYS_IT_STOPS_FR_RE.search(folded) or _SAYS_IT_STOPS_RE.search(v)):
             raise ValueError(
-                "opt_out_line_fr must ask for a reply Sellbird recognises as an opt-out, "
-                "e.g. Répondez « non merci » / Répondez STOP. Recognised: "
-                + ", ".join(f'"{w}"' for w in OPT_OUT_WORDS_FR) + "."
+                "opt_out_line_fr doesn't tell people they can stop these emails. Say so in "
+                "any words (\"Pas intéressé ? Répondez-moi simplement et je ne vous écrirai plus.\")."
             )
         return v
 
@@ -801,6 +889,19 @@ class WriterConfig(BaseModel):
     # The FACTS rule, the send gate and do-not-contact still apply. A file
     # that is set but can't be read stops writing until it's fixed.
     email_rules: str = ""
+    # Give the Writer what the free homepage signals found (no structured
+    # data, a site untouched for months, ...) so an email
+    # can name one concrete thing to change. They come from an automated read
+    # of one page and can be wrong (a booking widget that loads late is
+    # missed), so check a draft's claim against the site before approving it.
+    # false = the Writer never sees them.
+    site_facts: bool = True
+    # true = write a first email only for a prospect with something concrete to
+    # build its one tip on: a finding from site_facts, a startup fact, a signal
+    # or the Scout's research notes. Anyone without is marked "no_tip" and not
+    # written for, instead of getting a draft that says it has no advice. Put
+    # them back with `sellbird retry-writes --no-tip`, once more is known.
+    require_tip: bool = False
 
     @field_validator("first_email", mode="before")
     @classmethod
@@ -854,6 +955,16 @@ def load_email_rules(config) -> str:
     return text
 
 
+class HandoffConfig(BaseModel):
+    """Who gets a prospect who says yes to your offer (sellbird.handoff):
+    one tool on another system's MCP server."""
+    mcp_url: str = ""
+    mcp_command: list[str] = []
+    token_env: str = ""
+    tool: str = ""
+    arguments: dict = {}
+
+
 class SellbirdConfig(BaseModel):
     persona: PersonaConfig
     product: ProductConfig
@@ -863,6 +974,7 @@ class SellbirdConfig(BaseModel):
     brain: BrainConfig = BrainConfig()
     compliance: ComplianceConfig = ComplianceConfig()
     writer: WriterConfig = WriterConfig()
+    handoff: HandoffConfig = HandoffConfig()
     # The file it was loaded from, so a running Sellbird can re-read the
     # sending mode from that same file (refresh_sending_mode).
     _source_path: str | None = PrivateAttr(default=None)
@@ -909,12 +1021,40 @@ def _format_validation_error(e: ValidationError) -> str:
     return "\n".join(lines)
 
 
+_CURRENT_CONFIG: ContextVar["SellbirdConfig | None"] = ContextVar("sellbird_config", default=None)
+
+
+@contextmanager
+def use_config(config: "SellbirdConfig") -> Iterator["SellbirdConfig"]:
+    """Make ``config`` what ``load_config()`` returns, for this task and the
+    threads it starts. A server keeping each workspace's settings somewhere
+    other than a sellbird.yaml loads them and runs the work inside this."""
+    token = _CURRENT_CONFIG.set(config)
+    try:
+        yield config
+    finally:
+        _CURRENT_CONFIG.reset(token)
+
+
+def current_config() -> "SellbirdConfig | None":
+    """The config set with ``use_config``, or None when the file decides."""
+    return _CURRENT_CONFIG.get()
+
+
 def load_config(config_path: str | None = None) -> SellbirdConfig:
     """Load Sellbird configuration from YAML file.
 
     Raises ConfigError with a clear, actionable message on any problem.
     """
     if config_path is None:
+        given = _CURRENT_CONFIG.get()
+        if given is not None:
+            return given
+        from sellbird.workspace_home import current_home
+        if current_home().hosted:
+            # A hosted home has no file to fall back to: its settings must have
+            # been loaded with use_config for this request or tick.
+            raise ConfigFileNotFoundError("This workspace's settings weren't loaded.")
         config_path = _find_config_file()
 
     try:
@@ -1195,13 +1335,30 @@ def _find_config_file() -> str:
     the tracked ``sellbird.yaml`` stays an untrained template — nobody
     publishes their positioning, pricing, and prospect targeting by accident.
     """
-    candidates = [
-        Path.cwd() / "sellbird.local.yaml",
-        PROJECT_ROOT / "sellbird.local.yaml",
-        Path.cwd() / "sellbird.yaml",
-        Path.cwd().parent / "sellbird.yaml",
-        PROJECT_ROOT / "sellbird.yaml",
-    ]
+    # A home that names its config file uses exactly that one.
+    from sellbird.workspace_home import current_home
+    home_config = current_home().config_file
+    if home_config is not None:
+        if not home_config.exists():
+            raise ConfigFileNotFoundError(
+                f"sellbird.yaml not found at {home_config}. "
+                "Create one from sellbird.yaml.example or run 'sellbird setup'."
+            )
+        return str(home_config)
+    # The working directory counts only for a checkout run in place. A home
+    # folder (SELLBIRD_HOME, a pipx install, Docker) reads its own config even
+    # when started from a folder holding a sellbird.yaml.
+    from sellbird.paths import HOME_ENV, is_checkout
+    if is_checkout(PROJECT_ROOT) and not os.environ.get(HOME_ENV, "").strip():
+        candidates = [
+            Path.cwd() / "sellbird.local.yaml",
+            PROJECT_ROOT / "sellbird.local.yaml",
+            Path.cwd() / "sellbird.yaml",
+            Path.cwd().parent / "sellbird.yaml",
+            PROJECT_ROOT / "sellbird.yaml",
+        ]
+    else:
+        candidates = [PROJECT_ROOT / "sellbird.local.yaml", PROJECT_ROOT / "sellbird.yaml"]
     for path in candidates:
         if path.exists():
             return str(path)
