@@ -10,7 +10,8 @@ a Google Workspace account with an app password, or self-hosted mail.
     SMTP_PASSWORD=        IMAP_PASSWORD=   (defaults to SMTP_PASSWORD)
 
 Sends as the configured persona (name + email). IMAP polling fetches
-UNSEEN inbox messages and marks them seen after retrieval.
+UNSEEN inbox messages and marks them seen after retrieval. It also reads the
+Junk folder for replies that landed there, without changing anything in it.
 """
 
 import asyncio
@@ -18,7 +19,9 @@ import email
 import email.policy
 import imaplib
 import logging
+import re
 from dataclasses import asdict, dataclass, field
+from datetime import date, timedelta
 from email.message import EmailMessage
 from email.utils import formataddr, make_msgid, parseaddr
 
@@ -37,6 +40,50 @@ from sellbird.integrations.signature import SignatureError, load_signature, set_
 _AUTO_REPLY_HEADERS = ("Auto-Submitted", "X-Autoreply", "X-Autorespond", "X-Autoresponse",
                        "Precedence")
 logger = logging.getLogger("sellbird.smtp")
+
+# Some hosts' filters put ordinary mail in Junk, so a prospect's answer can
+# land there and its follow-ups would carry on. Junk is read too, but only for
+# messages in a thread (In-Reply-To or References): warmup mail and spam never
+# reach the handler, and neither does a bare bounce, which the handler would
+# count toward the bounce kill switch even when it isn't about our mail. Junk
+# is opened read-only (nothing is marked seen or moved) and read by date, not
+# UNSEEN, so a reply opened in webmail first is still read; the handler's
+# dedup skips what it already handled.
+JUNK_DAYS = 7
+JUNK_SCAN = 500  # newest Junk messages whose thread headers are checked per read
+_JUNK_NAMES = frozenset({"junk", "spam", "junk e-mail", "junk email", "bulk mail",
+                         "courrier ind&aok-sirable"})  # IMAP's UTF-7 for "indésirable"
+_LIST_LINE = re.compile(rb'^\((?P<flags>[^)]*)\) (?:"(?:[^"\\]|\\.)*"|NIL) (?P<name>.+)$')
+_MONTHS = ("Jan", "Feb", "Mar", "Apr", "May", "Jun",
+           "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")  # IMAP dates are never localised
+_THREAD_HEADERS = "(BODY.PEEK[HEADER.FIELDS (IN-REPLY-TO REFERENCES)])"
+
+
+def _imap_date(day: date) -> str:
+    return f"{day.day}-{_MONTHS[day.month - 1]}-{day.year}"
+
+
+def _junk_folder(conn) -> str | None:
+    """The mailbox's Junk folder as LIST names it: the one flagged \\Junk
+    (RFC 6154), else one with a usual junk name. None if there's neither."""
+    status, lines = conn.list()
+    if status != "OK":
+        return None
+    by_name = None
+    for line in lines or ():
+        match = _LIST_LINE.match(line) if isinstance(line, bytes) else None
+        if not match:
+            continue
+        flags = match["flags"].lower().split()
+        if b"\\noselect" in flags or b"\\nonexistent" in flags:
+            continue
+        name = match["name"].decode("utf-8", "replace")
+        if b"\\junk" in flags:
+            return name
+        leaf = name.strip('"').lower().replace(".", "/").rsplit("/", 1)[-1]
+        if by_name is None and leaf in _JUNK_NAMES:
+            by_name = name
+    return by_name
 
 
 # Refused or never connected: the server definitely has no copy. Anything else
@@ -143,12 +190,12 @@ class SmtpImapProvider(MailProvider):
     async def get_replies(self, limit: int = 50) -> list[InboundMessage]:
         loop = asyncio.get_event_loop()
         try:
-            return await loop.run_in_executor(None, self._fetch_unseen, limit)
+            return await loop.run_in_executor(None, self._fetch_inbound, limit)
         except Exception as e:
             logger.error(f"IMAP fetch failed: {e}")
             return []
 
-    def _fetch_unseen(self, limit: int) -> list[InboundMessage]:
+    def _fetch_inbound(self, limit: int) -> list[InboundMessage]:
         out: list[InboundMessage] = []
         conn = imaplib.IMAP4_SSL(self.imap_host, self.imap_port)
         try:
@@ -165,11 +212,50 @@ class SmtpImapProvider(MailProvider):
                 parsed = self._parse_rfc822(parts[0][1])
                 if parsed:
                     out.append(parsed)
+            try:
+                out.extend(self._fetch_junk_replies(conn, limit))
+            except Exception as e:
+                # Best effort on top of the inbox: a quirky Junk folder must
+                # not hold sending over replies the inbox already gave.
+                logger.warning(f"IMAP: couldn't read the Junk folder: {e}")
         finally:
             try:
                 conn.logout()
             except Exception:
                 pass
+        return out
+
+    def _fetch_junk_replies(self, conn, limit: int) -> list[InboundMessage]:
+        """Messages in a thread from the last JUNK_DAYS of Junk, untouched."""
+        folder = _junk_folder(conn)
+        if not folder:
+            return []
+        status, _ = conn.select(folder, readonly=True)
+        if status != "OK":
+            return []
+        since = _imap_date(date.today() - timedelta(days=JUNK_DAYS))
+        status, data = conn.search(None, "SINCE", since)
+        if status != "OK" or not data or not data[0]:
+            return []
+        ids = data[0].split()[-JUNK_SCAN:]
+        status, parts = conn.fetch(b",".join(ids), _THREAD_HEADERS)
+        if status != "OK":
+            return []
+        in_thread = []
+        for part in parts or ():
+            if not isinstance(part, tuple) or not part[0]:
+                continue
+            headers = email.message_from_bytes(part[1] or b"")
+            if headers.get("In-Reply-To") or headers.get("References"):
+                in_thread.append(part[0].split()[0])
+        out: list[InboundMessage] = []
+        for msg_id in in_thread[-limit:]:
+            status, parts = conn.fetch(msg_id, "(BODY.PEEK[])")
+            if status != "OK" or not parts or not isinstance(parts[0], tuple):
+                continue
+            parsed = self._parse_rfc822(parts[0][1])
+            if parsed:
+                out.append(parsed)
         return out
 
     @staticmethod
