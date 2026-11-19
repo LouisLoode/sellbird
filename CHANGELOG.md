@@ -305,6 +305,16 @@ minor versions can still change behaviour.
 
 ### Fixed
 
+- **SMTP inboxes read replies that landed in Junk.** Some hosts' filters file
+  ordinary mail as junk, so a prospect's answer could sit there unread while
+  their follow-ups went out. The SMTP/IMAP provider now also reads the Junk
+  folder (the one flagged `\Junk`, else one named Junk, Spam and the like) for
+  the last 7 days, keeping only messages in a thread (`In-Reply-To` or
+  `References`): warmup mail and spam never reach the handler, and neither
+  does a bare bounce, which would count toward the bounce kill switch. Junk
+  is opened read-only, so nothing there is marked seen or moved, and a reply
+  you opened in webmail first is still read. If Junk can't be read, the inbox
+  replies still are.
 - **Instantly's daily cap counts your local day, not UTC** (from #177 by
   @solvejet-team), so the cap resets at your midnight.
 
